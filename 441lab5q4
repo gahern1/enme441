@@ -13,7 +13,7 @@ led_pins = [0,1,2,3,4,5,6,7,8,9]
 GPIO.setup(led_pins, GPIO.OUT)
 
 # Button pin (use pull-down)
-button_pin = 17
+button_pin = 21
 GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 
 # Set up PWM objects
