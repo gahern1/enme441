@@ -95,35 +95,35 @@ try:
 		dutyc = C*100
 		pwmc.ChangeDutyCycle(dutyc)
     
-		D=(math.sin(2*math.pi*f*t-phi))**2
+		D=(math.sin(2*math.pi*f*t-phid))**2
 		dutyd = D*100
 		pwmd.ChangeDutyCycle(dutyd)
 
-		E=(math.sin(2*math.pi*f*t-phi))**2
+		E=(math.sin(2*math.pi*f*t-phie))**2
 		dutye = E*100
 		pwme.ChangeDutyCycle(dutyc)
 
-		F=(math.sin(2*math.pi*f*t-phi))**2
+		F=(math.sin(2*math.pi*f*t-phif))**2
 		dutyf = F*100
 		pwmf.ChangeDutyCycle(dutyc)
 		
-		G=(math.sin(2*math.pi*f*t-phi))**2
+		G=(math.sin(2*math.pi*f*t-phig))**2
 		dutyg = C*100
 		pwmg.ChangeDutyCycle(dutyg)
 
-		H=(math.sin(2*math.pi*f*t-phi))**2
+		H=(math.sin(2*math.pi*f*t-phih))**2
 		dutyh = H*100
 		pwmh.ChangeDutyCycle(dutyc)
 
-		I=(math.sin(2*math.pi*f*t-phi))**2
+		I=(math.sin(2*math.pi*f*t-phii))**2
 		dutyi = I*100
 		pwmi.ChangeDutyCycle(dutyc)
 
-		J=(math.sin(2*math.pi*f*t-phi))**2
+		J=(math.sin(2*math.pi*f*t-phij))**2
 		dutyj = J*100
 		pwmj.ChangeDutyCycle(dutyc)
 
-		K=(math.sin(2*math.pi*f*t-phi))**2
+		K=(math.sin(2*math.pi*f*t-phik))**2
 		dutyk = K*100
 		pwmk.ChangeDutyCycle(dutyc)
     
