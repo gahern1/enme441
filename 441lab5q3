@@ -1,0 +1,135 @@
+import RPi.GPIO as GPIO
+import math
+import time 
+
+f = 0.2
+start = time.time()
+
+GPIO.setmode(GPIO.BCM)
+p=0
+GPIO.setup(p, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pc=1
+GPIO.setup(pc,GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pd=2
+GPIO.setup(pd, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pe=3
+GPIO.setup(pe, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pf=4
+GPIO.setup(pf, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pg=5
+GPIO.setup(pg, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+ph=6
+GPIO.setup(ph, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pi=7
+GPIO.setup(pi, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pj=8
+GPIO.setup(pj, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pk=9
+GPIO.setup(pk, GPIO.OUT)
+
+pwm = GPIO.PWM(p, 500)
+pwm.start(0)
+
+pwmc = GPIO.PWM(pc, 500)
+pwmc.start(0)
+
+pwmd = GPIO.PWM(pd, 500)
+pwmd.start(0)
+
+pwme = GPIO.PWM(pe, 500)
+pwme.start(0)
+
+pwmf = GPIO.PWM(pf, 500)
+pwmf.start(0)
+
+pwmg = GPIO.PWM(pg, 500)
+pwmg.start(0)
+
+pwmh = GPIO.PWM(ph, 500)
+pwmh.start(0)
+
+pwmi = GPIO.PWM(pi, 500)
+pwmi.start(0)
+
+pwmj = GPIO.PWM(pj, 500)
+pwmj.start(0)
+
+pwmk = GPIO.PWM(pk, 500)
+pwmk.start(0)
+
+phi=math.pi/11
+phid = phi+math.pi/11
+phie = phid+math.pi/11
+phif = phie+math.pi/11
+phig = phif+math.pi/11
+phih = phig+math.pi/11
+phii = phih+math.pi/11
+phij = phii+math.pi/11
+phik = phij+math.pi/11
+
+try:
+	while True:
+		t = time.time() - start
+		B = (math.sin(2*math.pi*f*t))**2
+		duty = B * 100
+		pwm.ChangeDutyCycle(duty)
+		C=(math.sin(2*math.pi*f*t-phi))**2
+		dutyc = C*100
+		pwmc.ChangeDutyCycle(dutyc)
+    
+    D=(math.sin(2*math.pi*f*t-phi))**2
+    dutyd = D*100
+    pwmd.ChangeDutyCycle(dutyd)
+
+    E=(math.sin(2*math.pi*f*t-phi))**2
+    dutye = E*100
+    pwme.ChangeDutyCycle(dutyc)
+
+    F=(math.sin(2*math.pi*f*t-phi))**2
+    dutyf = F*100
+    pwmf.ChangeDutyCycle(dutyc)
+
+    G=(math.sin(2*math.pi*f*t-phi))**2
+    dutyg = C*100
+    pwmg.ChangeDutyCycle(dutyg)
+
+    H=(math.sin(2*math.pi*f*t-phi))**2
+    dutyh = H*100
+    pwmh.ChangeDutyCycle(dutyc)
+
+    I=(math.sin(2*math.pi*f*t-phi))**2
+    dutyi = I*100
+    pwmi.ChangeDutyCycle(dutyc)
+
+    J=(math.sin(2*math.pi*f*t-phi))**2
+    dutyj = J*100
+    pwmj.ChangeDutyCycle(dutyc)
+
+    K=(math.sin(2*math.pi*f*t-phi))**2
+    dutyk = K*100
+    pwmk.ChangeDutyCycle(dutyc)
+    
+
+except KeyboardInterrupt:
+	pass
+
+pwm.stop()
+GPIO.cleanup()
