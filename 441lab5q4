@@ -18,7 +18,7 @@ for pwm in pwms:
     pwm.start(0)
 
 phi = math.pi/11
-direction = 1   # +1 forward, -1 backward
+direction = 1
 
 def flip_direction(channel):
     global direction
