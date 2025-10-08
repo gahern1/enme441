@@ -1,5 +1,5 @@
 import RPi.GPIO as GPIO,time,math
-p=0;f=0.2
+p=18;f=0.2
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(p,GPIO.OUT)
 pwm=GPIO.PWM(p,500)
