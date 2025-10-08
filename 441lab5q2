@@ -1,0 +1,38 @@
+import RPi.GPIO as GPIO
+import math
+import time 
+
+f = 0.2
+start = time.time()
+
+GPIO.setmode(GPIO.BCM)
+p=0
+GPIO.setup(p, GPIO.OUT)
+
+GPIO.setmode(GPIO.BCM)
+pc=1
+GPIO.setup(pc,GPIO.OUT)
+
+pwm = GPIO.PWM(p, 500)
+pwm.start(0)
+
+pwmc = GPIO.PWM(pc, 500)
+pwmc.start(0)
+
+phi=math.pi/11
+
+try:
+	while True:
+		t = time.time() - start
+		B = (math.sin(2*math.pi*f*t))**2
+		duty = B * 100
+		pwm.ChangeDutyCycle(duty)
+    C=(math.sin(2*math.pi.f*t-phi))**2
+    dutyc = C*100
+    pwmc.ChangeDutyCycle(dutyc)
+
+except KeyboardInterrupt:
+	pass
+
+pwm.stop()
+GPIO.cleanup()
