@@ -3,7 +3,7 @@ import time
 import math
 
 # --- Setup ---
-LED_PIN = 13   # pick your PWM-capable GPIO pin
+LED_PIN = 0   # pick your PWM-capable GPIO pin
 F_PWM = 500    # Hz, base frequency for PWM
 F_SIGNAL = 0.2 # Hz, modulation frequency for brightness
 
