@@ -1,35 +1,10 @@
-import RPi.GPIO as GPIO
-import time
-import math
-
-# --- Setup ---
-LED_PIN = 0   # pick your PWM-capable GPIO pin
-F_PWM = 500    # Hz, base frequency for PWM
-F_SIGNAL = 0.2 # Hz, modulation frequency for brightness
-
+import RPi.GPIO as GPIO,time,math
+p=0;f=0.2
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(LED_PIN, GPIO.OUT)
-
-pwm = GPIO.PWM(LED_PIN, F_PWM)
-pwm.start(0)  # start with 0% duty cycle (off)
-
+GPIO.setup(p,GPIO.OUT)
+pwm=GPIO.PWM(p,500)
+pwm.start(0)
+t0=time.time()
 try:
-    t0 = time.time()
-    while True:
-        # current time (relative)
-        t = time.time() - t0
-
-        # compute brightness B(t) = sin^2(2π f t)
-        B = math.sin(2 * math.pi * F_SIGNAL * t)**2
-
-        # scale to duty cycle (0–100)
-        duty = B * 100
-        pwm.ChangeDutyCycle(duty)
-        # no sleep: loop runs as fast as possible
-
-except KeyboardInterrupt:
-    pass
-
-finally:
-    pwm.stop()
-    GPIO.cleanup()
+  while 1:pwm.ChangeDutyCycle(100*math.sin(2*math.pi*f*(time.time()-t0))**2)
+except:GPIO.cleanup()
