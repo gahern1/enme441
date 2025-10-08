@@ -27,7 +27,7 @@ try:
 		B = (math.sin(2*math.pi*f*t))**2
 		duty = B * 100
 		pwm.ChangeDutyCycle(duty)
-		C=(math.sin(2*math.pi.f*t-phi))**2
+		C=(math.sin(2*math.pi*f*t-phi))**2
 		dutyc = C*100
 		pwmc.ChangeDutyCycle(dutyc)
 
