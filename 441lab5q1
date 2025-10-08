@@ -6,7 +6,7 @@ f = 0.2
 start = time.time()
 
 GPIO.setmode(GPIO.BCM)
-p=4
+p=0
 GPIO.setup(p, GPIO.OUT)
 
 pwm = GPIO.PWM(p, 500)
