@@ -1,10 +1,10 @@
-import RPi.GPIO as GPIO,time,math
-p=18;f=0.2
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(p,GPIO.OUT)
-pwm=GPIO.PWM(p,500)
-pwm.start(0)
-t0=time.time()
-try:
-  while 1:pwm.ChangeDutyCycle(100*math.sin(2*math.pi*f*(time.time()-t0))**2)
-except:GPIO.cleanup()
+import RPi.GPIO as GPIO
+from time import sleep # import time.sleep()
+GPIO.setmode(GPIO.BCM) # use BCM port numbering
+p = 4 # pin number
+GPIO.setup(p, GPIO.OUT) # assign the pin as output
+while True: # continuous loop
+GPIO.output(p, 0) # set output to 0V
+sleep(0.5) # wait 0.5 sec
+GPIO.output(p, 1) # set output to 3.3V
+sleep(0.5) # wait 0.5 sec
