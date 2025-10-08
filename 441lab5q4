@@ -1,0 +1,50 @@
+import RPi.GPIO as GPIO
+import math
+import time
+
+f = 0.2
+start = time.time()
+
+# BCM numbering
+GPIO.setmode(GPIO.BCM)
+
+# LED pins
+led_pins = [0,1,2,3,4,5,6,7,8,9]
+GPIO.setup(led_pins, GPIO.OUT)
+
+# Button pin (use pull-down)
+button_pin = 17
+GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+# Set up PWM objects
+pwms = [GPIO.PWM(pin, 500) for pin in led_pins]
+for pwm in pwms:
+    pwm.start(0)
+
+# Phase step
+phi = math.pi/11
+direction = 1   # +1 forward, -1 backward
+
+# Callback: flip direction
+def flip_direction(channel):
+    global direction
+    direction *= -1
+    print("Direction switched:", "forward" if direction==1 else "backward")
+
+# Attach threaded callback on button press
+GPIO.add_event_detect(button_pin, GPIO.RISING, callback=flip_direction, bouncetime=300)
+
+try:
+    while True:
+        t = time.time() - start
+        for idx, pwm in enumerate(pwms):
+            phase = idx * phi * direction
+            brightness = (math.sin(2*math.pi*f*t - phase))**2
+            pwm.ChangeDutyCycle(brightness * 100)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    for pwm in pwms:
+        pwm.stop()
+    GPIO.cleanup()
