@@ -101,11 +101,11 @@ try:
 
 		E=(math.sin(2*math.pi*f*t-phie))**2
 		dutye = E*100
-		pwme.ChangeDutyCycle(dutyc)
+		pwme.ChangeDutyCycle(dutye)
 
 		F=(math.sin(2*math.pi*f*t-phif))**2
 		dutyf = F*100
-		pwmf.ChangeDutyCycle(dutyc)
+		pwmf.ChangeDutyCycle(dutyf)
 		
 		G=(math.sin(2*math.pi*f*t-phig))**2
 		dutyg = C*100
@@ -113,19 +113,19 @@ try:
 
 		H=(math.sin(2*math.pi*f*t-phih))**2
 		dutyh = H*100
-		pwmh.ChangeDutyCycle(dutyc)
+		pwmh.ChangeDutyCycle(dutyh)
 
 		I=(math.sin(2*math.pi*f*t-phii))**2
 		dutyi = I*100
-		pwmi.ChangeDutyCycle(dutyc)
+		pwmi.ChangeDutyCycle(dutyi)
 
 		J=(math.sin(2*math.pi*f*t-phij))**2
 		dutyj = J*100
-		pwmj.ChangeDutyCycle(dutyc)
+		pwmj.ChangeDutyCycle(dutyj)
 
 		K=(math.sin(2*math.pi*f*t-phik))**2
 		dutyk = K*100
-		pwmk.ChangeDutyCycle(dutyc)
+		pwmk.ChangeDutyCycle(dutyk)
     
 
 except KeyboardInterrupt:
