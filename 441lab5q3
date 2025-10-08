@@ -108,7 +108,7 @@ try:
 		pwmf.ChangeDutyCycle(dutyf)
 		
 		G=(math.sin(2*math.pi*f*t-phig))**2
-		dutyg = C*100
+		dutyg = G*100
 		pwmg.ChangeDutyCycle(dutyg)
 
 		H=(math.sin(2*math.pi*f*t-phih))**2
