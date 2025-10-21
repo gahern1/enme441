@@ -22,9 +22,9 @@ try:
             bug.isWrapOn = not bug.isWrapOn
             last_s2 = s2_state
         if GPIO.input(s3) == GPIO.HIGH:
-            bug.timestep = 1/ 3
+            bug.timestep = .1/ 3
         else:
-            bug.timestep = 1
+            bug.timestep = .1
 
         bug.move_once()
 except KeyboardInterrupt:
