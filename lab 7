@@ -1,0 +1,89 @@
+import socket
+import RPi.GPIO as GPIO
+from urllib.parse import parse_qs
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+led_pins = [17, 27, 22]
+pwm_objects = []
+brightness = [0, 0, 0]
+
+for pin in led_pins:
+    GPIO.setup(pin, GPIO.OUT)
+    pwm = GPIO.PWM(pin, 1000)  # 1kHz frequency
+    pwm.start(0)
+    pwm_objects.append(pwm)
+
+def update_led(index, value):
+    brightness[index] = value
+    pwm_objects[index].ChangeDutyCycle(value)
+
+def generate_html():
+    html = """<!DOCTYPE html>
+<html>
+<head><title>LED Brightness Control</title></head>
+<body style="font-family: Arial; text-align: center;">
+<h2>Raspberry Pi LED Brightness Control</h2>
+<form method="POST" action="/">
+    <p>Select LED:</p>
+    <input type="radio" name="led" value="0" required> LED 1<br>
+    <input type="radio" name="led" value="1"> LED 2<br>
+    <input type="radio" name="led" value="2"> LED 3<br><br>
+    <label>Brightness (0–100):</label><br>
+    <input type="range" name="brightness" min="0" max="100" step="1"><br><br>
+    <input type="submit" value="Set Brightness">
+</form>
+<hr>
+<h3>Current LED Brightness Levels</h3>
+<ul>
+"""
+    for i in range(3):
+        html += f"<li>LED {i+1}: {brightness[i]}%</li>\n"
+    html += """
+</ul>
+</body>
+</html>"""
+    return html
+
+# TCP/IP server setup
+HOST = ''
+PORT = 8080
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind((HOST, PORT))
+server_socket.listen(1)
+
+print("Server running on port 8080...")
+
+try:
+    while True:
+        conn, addr = server_socket.accept()
+        request = conn.recv(1024).decode('utf-8')
+        print(f"Connection from {addr}")
+
+        # Check if POST request
+        if "POST" in request:
+            body = request.split('\r\n\r\n')[1]
+            data = parse_qs(body)
+            if 'led' in data and 'brightness' in data:
+                led_index = int(data['led'][0])
+                led_value = int(data['brightness'][0])
+                update_led(led_index, led_value)
+
+        response = generate_html()
+        http_response = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            f"Content-Length: {len(response.encode())}\r\n"
+            "Connection: close\r\n\r\n" +
+            response
+        )
+        conn.sendall(http_response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("Server stopped by user.")
+finally:
+    for pwm in pwm_objects:
+        pwm.stop()
+    GPIO.cleanup()
+    server_socket.close()
