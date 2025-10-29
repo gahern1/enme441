@@ -1,7 +1,6 @@
 import RPi.GPIO as GPIO
 import socket
 from urllib.parse import parse_qs
-import webbrowser
 
 # --- GPIO Setup ---
 GPIO.setmode(GPIO.BCM)
@@ -85,10 +84,7 @@ server_socket.listen(1)
 
 ip_address = get_ip_address()
 url = f"http://{ip_address}:8080"
-print(f"🌐 Server running at: {url}")
-
-# Automatically open the browser
-webbrowser.open(url)
+print(f"🌐 Server running at: {url}")  # Print the exact address for manual access
 
 try:
     while True:
@@ -121,3 +117,4 @@ except KeyboardInterrupt:
         pwm.stop()
     GPIO.cleanup()
     server_socket.close()
+
