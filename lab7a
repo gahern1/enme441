@@ -3,7 +3,6 @@ import socket
 from urllib.parse import parse_qs
 import os
 
-# --- GPIO Setup ---
 GPIO.setmode(GPIO.BCM)
 led_pins = [17, 27, 22]
 led_pwms = []
@@ -14,10 +13,8 @@ for pin in led_pins:
     pwm.start(0)
     led_pwms.append(pwm)
 
-# Track LED brightness levels
 led_levels = [0, 0, 0]
 
-# --- HTML Page Generator ---
 def generate_html():
     html_content = f"""<!DOCTYPE html>
 <html>
@@ -49,7 +46,6 @@ def generate_html():
 </html>"""
     return html_content
 
-# --- Server Setup ---
 HOST = ''
 PORT = 8080
 local_ip = os.popen("hostname -I").read().split()[0]
