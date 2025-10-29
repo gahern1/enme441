@@ -4,7 +4,7 @@ from urllib.parse import parse_qs
 import os
 
 GPIO.setmode(GPIO.BCM)
-LEDpins = [16, 20, 21]
+LEDpins = [17, 27, 22]
 pwms = []                  # initialize pwm list
 for i in LEDpins:
   GPIO.setup(i, GPIO.OUT)
