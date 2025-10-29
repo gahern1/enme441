@@ -1,0 +1,92 @@
+import RPi.GPIO as GPIO
+import socket
+from urllib.parse import parse_qs
+
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
+LEDpins = [17, 27, 22]
+pwms = []
+
+for i in LEDpins:
+    GPIO.setup(i, GPIO.OUT)
+    pwm = GPIO.PWM(i, 1000)
+    pwm.start(0)
+    pwms.append(pwm)
+
+brightness = [0, 0, 0]
+
+def html_generator():
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>LED Brightness Controller</title>
+</head>
+<body>
+  <h3>Brightness Level</h3>
+
+  <div>
+    <label>LED 1</label>
+    <input type="range" min="0" max="100" value="{brightness[0]}" id="led0" oninput="updateLED(0)">
+    <span id="val0">{brightness[0]}</span>
+  </div>
+
+  <div>
+    <label>LED 2</label>
+    <input type="range" min="0" max="100" value="{brightness[1]}" id="led1" oninput="updateLED(1)">
+    <span id="val1">{brightness[1]}</span>
+  </div>
+
+  <div>
+    <label>LED 3</label>
+    <input type="range" min="0" max="100" value="{brightness[2]}" id="led2" oninput="updateLED(2)">
+    <span id="val2">{brightness[2]}</span>
+  </div>
+
+  <script>
+  function updateLED(idx) {{
+    let val = document.getElementById("led" + idx).value;
+    document.getElementById("val" + idx).innerText = val;
+
+    fetch("/", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: "led=" + idx + "&level=" + val
+    }});
+  }}
+  </script>
+
+</body>
+</html>"""
+    return html
+
+# Start TCP/IP server
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind(('', 8080))  # Port 8080
+server_socket.listen(1)
+print("Server running on http://<your-pi-ip>:8080")
+
+try:
+    while True:
+        conn, addr = server_socket.accept()
+        request = conn.recv(1024).decode()
+        print(f"Request: {request}")
+
+        if 'POST' in request:
+            body = request.split("\r\n\r\n")[-1]
+            params = parse_qs(body)
+            if 'led' in params and 'level' in params:
+                idx = int(params['led'][0])
+                level = int(params['level'][0])
+                brightness[idx] = level
+                pwms[idx].ChangeDutyCycle(level)
+
+        response = 'HTTP/1.1 200 OK\nContent-Type: text/html\n\n' + html_generator()
+        conn.sendall(response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("Shutting down...")
+    for pwm in pwms:
+        pwm.stop()
+    GPIO.cleanup()
+    server_socket.close()
