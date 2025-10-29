@@ -2,42 +2,49 @@ import RPi.GPIO as GPIO
 import socket
 from urllib.parse import parse_qs
 
-# GPIO setup
+# --- GPIO Setup ---
 GPIO.setmode(GPIO.BCM)
 LEDpins = [17, 27, 22]
 pwms = []
 
-for i in LEDpins:
-    GPIO.setup(i, GPIO.OUT)
-    pwm = GPIO.PWM(i, 1000)
-    pwm.start(0)
+for pin in LEDpins:
+    GPIO.setup(pin, GPIO.OUT)
+    pwm = GPIO.PWM(pin, 1000)   # 1 kHz PWM frequency
+    pwm.start(0)                # Start at 0% brightness
     pwms.append(pwm)
 
-brightness = [0, 0, 0]
+brightness = [0, 0, 0]  # Keep track of brightness for each LED
 
-def html_generator():
+# --- HTML + JavaScript Page Generator ---
+def html_page():
     html = f"""<!DOCTYPE html>
 <html>
 <head>
+  <meta charset="UTF-8">
   <title>LED Brightness Controller</title>
+  <style>
+    body {{ font-family: Arial; text-align: center; margin-top: 50px; }}
+    .slider-container {{ margin: 20px auto; width: 300px; }}
+    input[type=range] {{ width: 100%; }}
+  </style>
 </head>
 <body>
-  <h3>Brightness Level</h3>
+  <h2>LED Brightness Controller</h2>
 
-  <div>
-    <label>LED 1</label>
+  <div class="slider-container">
+    <label>LED 1</label><br>
     <input type="range" min="0" max="100" value="{brightness[0]}" id="led0" oninput="updateLED(0)">
     <span id="val0">{brightness[0]}</span>
   </div>
 
-  <div>
-    <label>LED 2</label>
+  <div class="slider-container">
+    <label>LED 2</label><br>
     <input type="range" min="0" max="100" value="{brightness[1]}" id="led1" oninput="updateLED(1)">
     <span id="val1">{brightness[1]}</span>
   </div>
 
-  <div>
-    <label>LED 3</label>
+  <div class="slider-container">
+    <label>LED 3</label><br>
     <input type="range" min="0" max="100" value="{brightness[2]}" id="led2" oninput="updateLED(2)">
     <span id="val2">{brightness[2]}</span>
   </div>
@@ -54,23 +61,26 @@ def html_generator():
     }});
   }}
   </script>
-
 </body>
 </html>"""
     return html
 
-# Start TCP/IP server
+# --- TCP/IP Web Server ---
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server_socket.bind(('', 8080))  # Port 8080
+server_socket.bind(('', 8080))  # Listen on all network interfaces, port 8080
 server_socket.listen(1)
-print("Server running on http://<your-pi-ip>:8080")
+print("🌐 Server running at: http://raspberrypi.local:8080 (or use your Pi's IP if needed)")
 
 try:
     while True:
         conn, addr = server_socket.accept()
         request = conn.recv(1024).decode()
-        print(f"Request: {request}")
 
+        if not request:
+            conn.close()
+            continue
+
+        # Handle POST requests for LED control
         if 'POST' in request:
             body = request.split("\r\n\r\n")[-1]
             params = parse_qs(body)
@@ -79,13 +89,15 @@ try:
                 level = int(params['level'][0])
                 brightness[idx] = level
                 pwms[idx].ChangeDutyCycle(level)
+                print(f"LED {idx+1} brightness set to {level}%")
 
-        response = 'HTTP/1.1 200 OK\nContent-Type: text/html\n\n' + html_generator()
+        # Send updated HTML page
+        response = 'HTTP/1.1 200 OK\nContent-Type: text/html\n\n' + html_page()
         conn.sendall(response.encode())
         conn.close()
 
 except KeyboardInterrupt:
-    print("Shutting down...")
+    print("\n🛑 Shutting down...")
     for pwm in pwms:
         pwm.stop()
     GPIO.cleanup()
