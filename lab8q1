@@ -37,3 +37,5 @@ try:
     for i in range(256):
       s.shiftByte(i)
       sleep(0.1)
+except KeyboardInterrupt:
+    GPIO.cleanup()
