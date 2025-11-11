@@ -19,23 +19,14 @@ class Stepper:
     shift register output values for all motors.  In addition to
     simplifying sequential control of multiple motors, this schema
     also makes simultaneous operation of multiple motors possible.
-   
-    Motor instantiation sequence is inverted from the shift register outputs.
-    For example, in the case of 2 motors, the 2nd motor must be connected
-    with the first set of shift register outputs (Qa-Qd), and the 1st motor
-    with the second set of outputs (Qe-Qh). This is because the MSB of
-    the register is associated with Qa, and the LSB with Qh.
- 
-    An instance attribute (shifter_bit_start) tracks the bit position
-    in the shift register where the 4 control bits for each motor begin.
     """
 
     # Class attributes:
-    num_steppers = 0      # track number of Steppers instantiated
-    shifter_outputs = 0   # track shift register outputs for all motors
+    num_steppers = 0
+    shifter_outputs = 0
     seq = [0b0001,0b0011,0b0010,0b0110,0b0100,0b1100,0b1000,0b1001] # CCW sequence
     delay = 1200          # delay between motor steps [us]
-    steps_per_degree = 4096/360    # 4096 steps/rev * 1/360 rev/deg
+    steps_per_degree = 4096/360
 
     def __init__(self, shifter, lock):
         self.s = shifter
@@ -45,31 +36,22 @@ class Stepper:
         self.lock = lock
         Stepper.num_steppers += 1
 
-    # Signum function:
     def __sgn(self, x):
-        if x == 0: 
-            return 0
-        else: 
-            return int(abs(x)/x)
+        return 0 if x == 0 else int(abs(x)/x)
 
-    # Move a single +/-1 step in the motor sequence:
     def __step(self, dir):
-        self.step_state += dir
-        self.step_state %= 8
+        self.step_state = (self.step_state + dir) % 8
 
-        # Clear only this motor's 4 bits:
+        # Update shift register bits for this motor
         Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
-        # Set the new 4-bit pattern for this motor:
         Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
-        # Send updated output to shift register:
         self.s.shiftByte(Stepper.shifter_outputs)
 
-        # Update angle safely
+        # Update shared angle safely
         with self.angle.get_lock():
             self.angle.value += dir / Stepper.steps_per_degree
             self.angle.value %= 360
 
-    # Move relative angle from current position (for rotate method):
     def __rotate(self, delta):
         numSteps = int(Stepper.steps_per_degree * abs(delta))
         dir = self.__sgn(delta)
@@ -77,65 +59,59 @@ class Stepper:
             self.__step(dir)
             time.sleep(Stepper.delay / 1e6)
 
-    # Move relative angle in a separate process
     def rotate(self, delta):
+        """Rotate motor by a relative delta in a separate process."""
         time.sleep(0.1)
         p = multiprocessing.Process(target=self.__rotate, args=(delta,))
         p.start()
+        return p  # return process so main can join it
 
-    # Move to an absolute angle taking the shortest possible path:
     def goAngle(self, target_angle):
-        """
-        Rotate motor to the absolute angle `target_angle` using the shortest path.
-        """
-        def _rotate_to_target(shared_angle, delta):
-            numSteps = int(Stepper.steps_per_degree * abs(delta))
-            dir = 1 if delta > 0 else -1
-            for _ in range(numSteps):
-                self.__step(dir)
-                time.sleep(Stepper.delay / 1e6)
-
+        """Rotate motor to an absolute angle using shortest path."""
         with self.angle.get_lock():
             current_angle = self.angle.value
 
-        # Shortest path delta
+        # Compute shortest path
         delta = (target_angle - current_angle) % 360
         if delta > 180:
             delta -= 360
 
-        p = multiprocessing.Process(target=_rotate_to_target, args=(self.angle, delta))
-        p.start()
+        return self.rotate(delta)
 
-    # Set the motor zero point
     def zero(self):
         with self.angle.get_lock():
             self.angle.value = 0.0
 
 
-# Example use:
+# Example usage:
 if __name__ == '__main__':
-
-    s = Shifter(data=16, latch=20, clock=21)   # set up Shifter
-
-    # multiprocessing.Lock() still defined but not used
+    s = Shifter(data=16, latch=20, clock=21)
     lock = multiprocessing.Lock()
 
-    # Instantiate 2 Steppers:
+    # Instantiate 2 steppers
     m1 = Stepper(s, lock)
     m2 = Stepper(s, lock)
 
-    # Zero the motors:
+    # Zero the motors
     m1.zero()
     m2.zero()
 
-    # Both motors should now run simultaneously:
-    m1.rotate(90)
-    m1.rotate(-45)
+    # Example sequence of absolute positions
+    sequence = [
+        (90, -90),
+        (45, 0),
+        (180, 90),
+        (0, 45)
+    ]
 
-    # While the motors are running in their separate processes,
-    # the main code can continue doing its thing: 
-    try:
-        while True:
-            pass
-    except:
-        print('\nend')
+    for angle1, angle2 in sequence:
+        # Move both motors simultaneously
+        p1 = m1.goAngle(angle1)
+        p2 = m2.goAngle(angle2)
+        # Wait for both to finish
+        p1.join()
+        p2.join()
+        print(f"Motors reached angles: M1={angle1}, M2={angle2}")
+
+    print("All moves complete.")
+
