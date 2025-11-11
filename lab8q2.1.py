@@ -132,20 +132,6 @@ if __name__ == '__main__':
     m1.rotate(90)
     m1.rotate(-45)
 
-    m1.zero()
-    m2.zero()
-
-    m2.rotate(-90)
-    m2.rotate(45)
-
-    m1.zero()
-    m2.zero()
-
-    m1.rotate(-135)
-    m1.rotate(135)
-    m1.rotate(0)
-
-
     # While the motors are running in their separate processes,
     # the main code can continue doing its thing: 
     try:
