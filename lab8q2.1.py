@@ -114,26 +114,31 @@ class Stepper:
 
 # Example use:
 if __name__ == '__main__':
-
-    s = Shifter(data=16, latch=20, clock=21)   # set up Shifter
-
-    # multiprocessing.Lock() still defined but not used
+    s = Shifter(data=16, latch=20, clock=21)
     lock = multiprocessing.Lock()
 
-    # Instantiate 2 Steppers:
     m1 = Stepper(s, lock)
     m2 = Stepper(s, lock)
 
-    # Zero the motors:
     m1.zero()
     m2.zero()
-    m1.rotate(90)
-    m1.rotate(-45)
-    m2.rotate(-90)
-    m2.rotate(45)
-    m1.rotate(-135)
-    m1.rotate(135)
-    m1.rotate(0)
+
+    # Move motors with process joins to prevent conflicts
+    p1 = m1.goAngle(90)
+    p2 = m2.goAngle(-90)
+    p1.join()
+    p2.join()
+
+    p1 = m1.goAngle(45)   # shortest path from 90 -> 45
+    p2 = m2.goAngle(0)    # shortest path from -90 -> 0
+    p1.join()
+    p2.join()
+
+    p1 = m1.goAngle(180)
+    p1.join()
+
+    print("Motors reached target angles.")
+
 
     # While the motors are running in their separate processes,
     # the main code can continue doing its thing: 
