@@ -1,10 +1,15 @@
+import RPi.GPIO as GPIO
 import time
 import threading
 
-# Shared shift register output across all motors
+# --- Your existing Shifter class must be imported ---
+from shifter import Shifter
+
+# --- Shared state for all motors ---
 shifter_outputs = 0
 shifter_lock = threading.Lock()
 
+# --- Stepper motor class ---
 class Stepper:
     SEQUENCE = [0b0001,0b0011,0b0010,0b0110,0b0100,0b1100,0b1000,0b1001]
 
@@ -66,3 +71,27 @@ class Stepper:
 
     def stop(self):
         self.running = False
+
+# --- Main program ---
+if __name__ == '__main__':
+    GPIO.setwarnings(False)
+
+    # Initialize shift register
+    s = Shifter(data=16, latch=20, clock=21)
+
+    # Create two motors with different speeds
+    m1 = Stepper(s, bit_offset=0, delay_us=1200)  # Motor A: Q0–Q3
+    m2 = Stepper(s, bit_offset=4, delay_us=1500)  # Motor B: Q4–Q7
+
+    # Rotate both motors simultaneously
+    t1 = m1.rotate(512)   # ~1 revolution
+    t2 = m2.rotate(-512)  # opposite direction
+
+    # Wait until both finish
+    t1.join()
+    t2.join()
+
+    # Turn off all outputs
+    s.shiftByte(0b00000000)
+    GPIO.cleanup()
+    print("Motors finished")
