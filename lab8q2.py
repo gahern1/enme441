@@ -1,6 +1,10 @@
 import time
 import threading
 
+# Shared shift register output across all motors
+shifter_outputs = 0
+shifter_lock = threading.Lock()
+
 class Stepper:
     SEQUENCE = [0b0001,0b0011,0b0010,0b0110,0b0100,0b1100,0b1000,0b1001]
 
@@ -19,36 +23,34 @@ class Stepper:
         self.thread = None
 
     def __sgn(self, x):
-        if x == 0: return 0
-        return int(abs(x)/x)
+        return 0 if x == 0 else int(abs(x)/x)
 
     def __step(self, direction):
-        """Take a single step and update the shift register."""
+        global shifter_outputs
         self.step_index = (self.step_index + direction) % 8
         pattern = Stepper.SEQUENCE[self.step_index] << self.bit_offset
-
-        # Mask to clear only this motor's bits
         mask = 0b1111 << self.bit_offset
-        Stepper.shifter_outputs = getattr(Stepper, 'shifter_outputs', 0)
-        Stepper.shifter_outputs &= ~mask
-        Stepper.shifter_outputs |= pattern
 
-        self.shifter.shiftByte(Stepper.shifter_outputs)
+        # Thread-safe update of shared shift register
+        with shifter_lock:
+            shifter_outputs &= ~mask
+            shifter_outputs |= pattern
+            self.shifter.shiftByte(shifter_outputs)
+
         self.angle = (self.angle + direction / (4096/360)) % 360
 
     def __rotate(self, steps):
-        """Rotate motor by a number of steps."""
         self.running = True
         direction = self.__sgn(steps)
         for _ in range(abs(steps)):
             if not self.running:
                 break
             self.__step(direction)
-            time.sleep(self.delay_us/1e6)
+            time.sleep(self.delay_us / 1e6)
         self.running = False
 
     def rotate(self, steps):
-        """Start rotation in a separate thread."""
+        """Start rotation in a thread and return the thread handle."""
         if self.thread and self.thread.is_alive():
             return
         self.thread = threading.Thread(target=self.__rotate, args=(steps,))
@@ -56,7 +58,7 @@ class Stepper:
         return self.thread
 
     def goAngle(self, target_angle):
-        """Move to an absolute angle using shortest path."""
+        """Rotate to absolute angle using shortest path."""
         delta = (target_angle - self.angle) % 360
         if delta > 180:
             delta -= 360
