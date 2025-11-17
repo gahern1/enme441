@@ -1,0 +1,151 @@
+# ============================================================
+#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM
+#  Option A (slider -> absolute angle)
+#  Partners: Glen & Lucas
+# ============================================================
+
+import RPi.GPIO as GPIO
+import socket
+from urllib.parse import parse_qs
+import multiprocessing
+import time
+from shifter import Shifter
+from stepper_class_shiftregister_multiprocessing import Stepper
+
+# -----------------------
+# Initialize Shift Register + Motors
+# -----------------------
+GPIO.setmode(GPIO.BCM)
+
+s = Shifter(data=16, latch=20, clock=21)
+lock = multiprocessing.Lock()
+
+m1 = Stepper(s, lock)
+m2 = Stepper(s, lock)
+
+m1.zero()
+m2.zero()
+
+slider_vals = [0, 0]   # slider 0 = motor1, slider 1 = motor2
+
+
+# -----------------------
+# HTML PAGE
+# -----------------------
+def html_page():
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Stepper Motor Controller</title>
+  <style>
+    body {{ font-family: Arial; text-align: center; margin-top: 40px; }}
+    .slider-container {{ margin: 25px auto; width: 300px; }}
+    input[type=range] {{ width: 100%; }}
+  </style>
+</head>
+<body>
+
+  <h2>Stepper Motor Angle Controller</h2>
+
+  <div class="slider-container">
+    <label>Motor 1 Angle</label><br>
+    <input type="range" min="0" max="100" value="{slider_vals[0]}" id="motor0" oninput="updateMotor(0)">
+    <span id="val0">{slider_vals[0]}</span>
+  </div>
+
+  <div class="slider-container">
+    <label>Motor 2 Angle</label><br>
+    <input type="range" min="0" max="100" value="{slider_vals[1]}" id="motor1" oninput="updateMotor(1)">
+    <span id="val1">{slider_vals[1]}</span>
+  </div>
+
+  <script>
+  function updateMotor(idx) {{
+    let val = document.getElementById("motor" + idx).value;
+    document.getElementById("val" + idx).innerText = val;
+
+    fetch("/", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: "motor=" + idx + "&level=" + val
+    }});
+  }}
+  </script>
+
+</body>
+</html>"""
+    return html
+
+
+# -----------------------
+# Helper: Get Pi LAN IP
+# -----------------------
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+# -----------------------
+# Web Server
+# -----------------------
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.bind(('', 8080))
+server_socket.listen(1)
+
+ip = get_ip_address()
+print(f"🌐 Control your motors at: http://{ip}:8080")
+
+try:
+    while True:
+        conn, addr = server_socket.accept()
+        request = conn.recv(2048).decode()
+
+        if not request:
+            conn.close()
+            continue
+
+        # ----------------------------------------
+        # Handle POST: move motors based on slider
+        # ----------------------------------------
+        if "POST" in request:
+            body = request.split("\r\n\r\n")[-1]
+            params = parse_qs(body)
+
+            if "motor" in params and "level" in params:
+
+                motor_idx = int(params["motor"][0])  # 0 or 1
+                level = int(params["level"][0])      # 0–100 slider
+
+                # Remember slider value so HTML updates
+                slider_vals[motor_idx] = level
+
+                # Map 0–100 → 0–360 degrees
+                target_angle = (level / 100) * 360
+
+                # Pick which motor
+                motor = m1 if motor_idx == 0 else m2
+
+                # Move motor (blocking)
+                p = motor.goAngle(target_angle)
+                p.join()
+
+                print(f"Motor {motor_idx+1} → {target_angle:.1f} degrees")
+
+        # Send HTML back
+        response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
+        conn.sendall(response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+finally:
+    GPIO.cleanup()
+    server_socket.close()
