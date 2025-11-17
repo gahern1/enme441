@@ -1,0 +1,105 @@
+import RPi.GPIO as GPIO
+import time
+
+GPIO.setmode(GPIO.BCM)
+
+# ------------------------------------------------------------
+#  SHIFT REGISTER CLASS
+# ------------------------------------------------------------
+class Shifter:
+    def __init__(self, data, clock, latch):
+        self.dataPin = data
+        self.clockPin = clock
+        self.latchPin = latch
+
+        GPIO.setup(self.dataPin, GPIO.OUT)
+        GPIO.setup(self.clockPin, GPIO.OUT)
+        GPIO.setup(self.latchPin, GPIO.OUT)
+
+        GPIO.output(self.dataPin, 0)
+        GPIO.output(self.clockPin, 0)
+        GPIO.output(self.latchPin, 0)
+
+    def pulse(self, pin):
+        GPIO.output(pin, 1)
+        time.sleep(0.000001)
+        GPIO.output(pin, 0)
+        time.sleep(0.000001)
+
+    def write(self, pattern):
+        # pattern is 4 bits: [A,B,C,D]
+        GPIO.output(self.latchPin, 0)
+
+        # Push 8 bits into shift register (we only use the lower 4)
+        for bit in pattern:
+            GPIO.output(self.dataPin, bit)
+            self.pulse(self.clockPin)
+
+        GPIO.output(self.latchPin, 1)
+
+
+# ------------------------------------------------------------
+#  STEPPER CLASS — ALWAYS ROTATES CW ONLY
+# ------------------------------------------------------------
+class Stepper:
+    def __init__(self, shifter, steps_per_rev=2048):
+        self.sr = shifter
+        self.steps_per_rev = steps_per_rev
+        self.current_angle = 0.0
+
+        # 8-step half-stepping sequence
+        self.seq = [
+            [1,0,0,1],
+            [1,0,0,0],
+            [1,1,0,0],
+            [0,1,0,0],
+            [0,1,1,0],
+            [0,0,1,0],
+            [0,0,1,1],
+            [0,0,0,1]
+        ]
+
+    def step_CW(self):
+        for pattern in self.seq:
+            self.sr.write(pattern)
+            time.sleep(0.002)
+
+    def goAngle(self, target_angle):
+        """
+        Rotate ONLY CW (never reverses) until reaching target absolute angle.
+        Uses wrap-around if needed.
+        """
+        if target_angle < self.current_angle:
+            target_angle += 360
+
+        delta = target_angle - self.current_angle
+        steps_needed = int(self.steps_per_rev * (delta / 360.0))
+
+        for _ in range(steps_needed):
+            self.step_CW()
+
+        self.current_angle = target_angle % 360
+
+
+# ------------------------------------------------------------
+#  MAIN CODE
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        # define shift register pins
+        data = 17
+        clock = 27
+        latch = 22
+
+        sr = Shifter(data, clock, latch)
+        motor = Stepper(sr)
+
+        while True:
+            angle = float(input("Enter target angle (0-360): "))
+            motor.goAngle(angle)
+            print("Reached angle:", motor.current_angle)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        GPIO.cleanup()
