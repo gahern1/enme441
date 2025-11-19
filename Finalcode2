@@ -41,7 +41,7 @@ class Stepper:
         self.s.shiftByte(Stepper.shifter_outputs)
 
         with self.angle.get_lock():
-            self.angle.value = (self.angle.value + direction / Stepper.steps_per_degree)
+            self.angle.value = (self.angle.value + direction / Stepper.steps_per_degree) % 360
 
     def __rotate(self, delta):
         num_steps = int(Stepper.steps_per_degree * abs(delta))
@@ -56,16 +56,16 @@ class Stepper:
         p.start()
         return p
 
-    # ============================================================
-    #     *** CHANGED SECTION — NO SHORTEST PATH ANYMORE ***
-    # ============================================================
+    # =====================================================
+    #   FIXED goAngle (ALWAYS MOVES SAME DIRECTION)
+    #   Motor ONLY rotates forward until reaching target
+    # =====================================================
     def goAngle(self, target_angle):
-        """Rotate strictly in whatever direction the delta says."""
         with self.angle.get_lock():
             current = self.angle.value
 
-        # NO modulo, NO shortest path
-        delta = target_angle - current
+        # Always rotate forward only
+        delta = (target_angle - current) % 360
 
         return self.rotate(delta)
 
