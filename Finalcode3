@@ -1,5 +1,6 @@
 # ============================================================
-#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Shortest-path fix)
+#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM
+#  Integer-step approach (no extra rotations)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -10,7 +11,7 @@ import time
 from shifter import Shifter
 
 # ============================================================
-#   STEPPER CLASS (Single background process per motor, shortest-path)
+#   STEPPER CLASS (Integer-step counting, shortest-path)
 # ============================================================
 
 class Stepper:
@@ -18,46 +19,48 @@ class Stepper:
     shifter_outputs = 0
     seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
     delay = 1200
-    steps_per_degree = 4096 / 360
+    steps_per_degree = 4096 / 360  # steps per degree
 
     def __init__(self, shifter, lock):
         self.s = shifter
-        self.lock = lock  # lock to prevent race conditions on shifter_outputs
-        self.angle = multiprocessing.Value('d', 0.0)
+        self.lock = lock  # lock to prevent race conditions
+        self.steps_taken = multiprocessing.Value('i', 0)  # track absolute integer steps
         self.target_angle = multiprocessing.Value('d', 0.0)
         self.step_state = 0
         self.shifter_bit_start = 4 * Stepper.num_steppers
         Stepper.num_steppers += 1
 
-        # Start background process
+        # start background process
         self.process = multiprocessing.Process(target=self._motor_loop)
         self.process.daemon = True
         self.process.start()
 
+    def _current_angle(self):
+        with self.steps_taken.get_lock():
+            return (self.steps_taken.value / Stepper.steps_per_degree) % 360
+
     def _step(self, direction):
         self.step_state = (self.step_state + direction) % 8
-        # lock around shared shifter_outputs
+        # update shift register safely
         with self.lock:
             Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
             Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
             self.s.shiftByte(Stepper.shifter_outputs)
 
-        with self.angle.get_lock():
-            self.angle.value += direction / Stepper.steps_per_degree
-            self.angle.value %= 360
+        # increment integer steps
+        with self.steps_taken.get_lock():
+            self.steps_taken.value += direction
 
     def _motor_loop(self):
         while True:
-            with self.angle.get_lock():
-                current = self.angle.value
+            current = self._current_angle()
             with self.target_angle.get_lock():
                 target = self.target_angle.value
 
-            # shortest-path delta calculation
-            delta = (target - current + 180) % 360 - 180
-
-            if abs(delta) >= 0.1:  # tolerance to prevent jitter
-                direction = 1 if delta > 0 else -1
+            # shortest-path delta in degrees
+            delta_deg = (target - current + 180) % 360 - 180
+            if abs(delta_deg) >= (1 / Stepper.steps_per_degree):  # at least 1 step
+                direction = 1 if delta_deg > 0 else -1
                 self._step(direction)
                 time.sleep(Stepper.delay / 1e6)
             else:
@@ -68,10 +71,11 @@ class Stepper:
             self.target_angle.value = angle % 360
 
     def zero(self):
-        with self.angle.get_lock():
-            self.angle.value = 0.0
+        with self.steps_taken.get_lock():
+            self.steps_taken.value = 0
         with self.target_angle.get_lock():
             self.target_angle.value = 0.0
+        self.step_state = 0
 
 # ============================================================
 #   SETUP SHIFT REGISTER + MOTORS
