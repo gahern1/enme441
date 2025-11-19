@@ -1,6 +1,5 @@
 # ============================================================
 #  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Self-contained)
-#  Partners: Glen & Lucas
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -8,10 +7,11 @@ import socket
 from urllib.parse import parse_qs
 import multiprocessing
 import time
-from shifter import Shifter     # this must exist in directory
+from shifter import Shifter
+
 
 # ============================================================
-#   STEPPER CLASS (fully included, no external import needed)
+#   STEPPER CLASS (Option A: direct angle, no switching dir)
 # ============================================================
 
 class Stepper:
@@ -19,11 +19,11 @@ class Stepper:
     shifter_outputs = 0
     seq = [0b0001,0b0011,0b0010,0b0110,0b0100,0b1100,0b1000,0b1001]
     delay = 1200
-    steps_per_degree = 4096/360.0   # steps per degree (float)
+    steps_per_degree = 4096/360
 
     def __init__(self, shifter, lock):
         self.s = shifter
-        self.angle = multiprocessing.Value('d', 0.0)  # shared absolute angle in degrees [0,360)
+        self.angle = multiprocessing.Value('d', 0.0)
         self.step_state = 0
         self.shifter_bit_start = 4 * Stepper.num_steppers
         self.lock = lock
@@ -33,64 +33,44 @@ class Stepper:
         return 0 if x == 0 else int(abs(x)/x)
 
     def __step(self, direction):
-        """Perform one sequence step (direction = +1 or -1) and update shared angle."""
         self.step_state = (self.step_state + direction) % 8
 
-        # Update the global shift-register outputs for all motors
         Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
         Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
 
-        # Write to the shift register hardware
         self.s.shiftByte(Stepper.shifter_outputs)
 
-        # Update the shared angle (add small increment per step)
         with self.angle.get_lock():
-            # Each sequence step corresponds to 1 "step", so add 1 / steps_per_degree degrees
-            self.angle.value = (self.angle.value + direction / Stepper.steps_per_degree) % 360.0
+            self.angle.value += direction / Stepper.steps_per_degree
+
+            # keep angle within 0–360 for display sanity
+            self.angle.value %= 360
 
     def __rotate(self, delta):
-        """
-        Rotate by *delta* degrees in the direction implied by sign(delta).
-        This routine executes in a separate process.
-        """
-        # number of discrete steps to take (use round to avoid truncation artifacts)
-        num_steps = int(round(Stepper.steps_per_degree * abs(delta)))
+        steps = int(abs(delta) * Stepper.steps_per_degree)
         direction = self.__sgn(delta)
 
-        for _ in range(num_steps):
+        for _ in range(steps):
             self.__step(direction)
             time.sleep(Stepper.delay / 1e6)
 
     def rotate(self, delta):
-        """Start a process that rotates the motor by delta degrees (may be forward-only delta)."""
         p = multiprocessing.Process(target=self.__rotate, args=(delta,))
         p.start()
         return p
 
-    # =====================================================
-    #   goAngle: FORWARD-ONLY (no reversing mid-move)
-    # =====================================================
+    # ======================================================
+    # NEW BEHAVIOR (Option A):
+    # Move directly to target: forward if higher, backward if lower.
+    # NEVER switch direction mid-move. NEVER wrap around. 
+    # ======================================================
     def goAngle(self, target_angle):
-        """
-        Rotate to an absolute target angle.
-        This implementation ALWAYS moves in the forward direction (increasing angle),
-        using wrap-around to go past 360 if necessary. It will NOT reverse direction.
-        """
-
-        # normalize the input target angle to [0,360)
-        target_angle = float(target_angle) % 360.0
+        target_angle = float(target_angle) % 360
 
         with self.angle.get_lock():
             current = float(self.angle.value)
 
-        # Compute forward-only delta using modulo arithmetic: this yields a value in [0,360)
-        delta = (target_angle - current) % 360.0
-
-        # For debugging: compute how many discrete steps will be executed
-        num_steps = int(round(Stepper.steps_per_degree * abs(delta)))
-
-        # DEBUG PRINT — shows exactly what will be commanded to the motor
-        print(f"[DEBUG] goAngle: current={current:.4f}°, target={target_angle:.4f}°, delta={delta:.4f}°, num_steps={num_steps}")
+        delta = target_angle - current   # <-- DIRECT movement, no modulo
 
         return self.rotate(delta)
 
@@ -114,7 +94,7 @@ m2 = Stepper(s, lock)
 m1.zero()
 m2.zero()
 
-slider_vals = [0, 0]  # Motor1 slider, Motor2 slider
+slider_vals = [0, 0]
 
 
 # ============================================================
@@ -167,7 +147,7 @@ function updateMotor(idx) {{
 
 
 # ============================================================
-#   GET IP FOR WEBPAGE LINK
+#   GET IP ADDRESS
 # ============================================================
 
 def get_ip_address():
@@ -183,7 +163,7 @@ def get_ip_address():
 
 
 # ============================================================
-#   START WEB SERVER
+#   WEB SERVER LOOP
 # ============================================================
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -195,8 +175,7 @@ print(f"🌐 Control motors at: http://{get_ip_address()}:8080")
 try:
     while True:
         conn, addr = server.accept()
-        request = conn.recv(4096).decode()
-
+        request = conn.recv(2048).decode()
         if not request:
             conn.close()
             continue
@@ -206,19 +185,18 @@ try:
             params = parse_qs(body)
 
             if "motor" in params and "level" in params:
-                motor_idx = int(params["motor"][0])
+                idx = int(params["motor"][0])
                 level = int(params["level"][0])
 
-                slider_vals[motor_idx] = level
-                target_angle = (level / 100.0) * 360.0
+                slider_vals[idx] = level
+                target_angle = (level / 100) * 360
 
-                motor = m1 if motor_idx == 0 else m2
+                motor = m1 if idx == 0 else m2
 
-                # Start movement and wait for it to complete
                 p = motor.goAngle(target_angle)
                 p.join()
 
-                print(f"Motor {motor_idx+1} → {target_angle:.2f}°")
+                print(f"Motor {idx+1} → {target_angle:.2f}°")
 
         conn.sendall(("HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()).encode())
         conn.close()
