@@ -1,5 +1,5 @@
 # ============================================================
-#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Fixed Motor 2)
+#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Shortest-path fix)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -10,7 +10,7 @@ import time
 from shifter import Shifter
 
 # ============================================================
-#   STEPPER CLASS (Single background process per motor, shared shifter lock)
+#   STEPPER CLASS (Single background process per motor, shortest-path)
 # ============================================================
 
 class Stepper:
@@ -34,9 +34,6 @@ class Stepper:
         self.process.daemon = True
         self.process.start()
 
-    def _sgn(self, x):
-        return 0 if x == 0 else int(abs(x) / x)
-
     def _step(self, direction):
         self.step_state = (self.step_state + direction) % 8
         # lock around shared shifter_outputs
@@ -56,7 +53,9 @@ class Stepper:
             with self.target_angle.get_lock():
                 target = self.target_angle.value
 
-            delta = target - current
+            # shortest-path delta calculation
+            delta = (target - current + 180) % 360 - 180
+
             if abs(delta) >= 0.1:  # tolerance to prevent jitter
                 direction = 1 if delta > 0 else -1
                 self._step(direction)
