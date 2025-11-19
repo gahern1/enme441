@@ -9,17 +9,16 @@ import multiprocessing
 import time
 from shifter import Shifter
 
-
 # ============================================================
-#   STEPPER CLASS (Option A: direct angle, no switching dir)
+#   STEPPER CLASS (Direct angle movement, no switching)
 # ============================================================
 
 class Stepper:
     num_steppers = 0
     shifter_outputs = 0
-    seq = [0b0001,0b0011,0b0010,0b0110,0b0100,0b1100,0b1000,0b1001]
+    seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
     delay = 1200
-    steps_per_degree = 4096/360
+    steps_per_degree = 4096 / 360
 
     def __init__(self, shifter, lock):
         self.s = shifter
@@ -27,57 +26,50 @@ class Stepper:
         self.step_state = 0
         self.shifter_bit_start = 4 * Stepper.num_steppers
         self.lock = lock
+        self.process = None
         Stepper.num_steppers += 1
 
     def __sgn(self, x):
-        return 0 if x == 0 else int(abs(x)/x)
+        return 0 if x == 0 else int(abs(x) / x)
 
     def __step(self, direction):
         self.step_state = (self.step_state + direction) % 8
-
         Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
         Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
-
         self.s.shiftByte(Stepper.shifter_outputs)
 
         with self.angle.get_lock():
             self.angle.value += direction / Stepper.steps_per_degree
-
-            # keep angle within 0–360 for display sanity
             self.angle.value %= 360
 
     def __rotate(self, delta):
         steps = int(abs(delta) * Stepper.steps_per_degree)
         direction = self.__sgn(delta)
-
         for _ in range(steps):
             self.__step(direction)
             time.sleep(Stepper.delay / 1e6)
 
     def rotate(self, delta):
-        p = multiprocessing.Process(target=self.__rotate, args=(delta,))
-        p.start()
-        return p
+        # Stop existing process if running
+        if self.process is not None and self.process.is_alive():
+            self.process.terminate()
+            self.process.join()
 
-    # ======================================================
-    # NEW BEHAVIOR (Option A):
-    # Move directly to target: forward if higher, backward if lower.
-    # NEVER switch direction mid-move. NEVER wrap around. 
-    # ======================================================
+        self.process = multiprocessing.Process(target=self.__rotate, args=(delta,))
+        self.process.start()
+        return self.process
+
     def goAngle(self, target_angle):
         target_angle = float(target_angle) % 360
-
         with self.angle.get_lock():
             current = float(self.angle.value)
 
-        delta = target_angle - current   # <-- DIRECT movement, no modulo
-
+        delta = target_angle - current  # direct movement, no wrap
         return self.rotate(delta)
 
     def zero(self):
         with self.angle.get_lock():
             self.angle.value = 0.0
-
 
 # ============================================================
 #   SETUP SHIFT REGISTER + MOTORS
@@ -95,7 +87,6 @@ m1.zero()
 m2.zero()
 
 slider_vals = [0, 0]
-
 
 # ============================================================
 #   HTML PAGE
@@ -145,7 +136,6 @@ function updateMotor(idx) {{
 </body>
 </html>"""
 
-
 # ============================================================
 #   GET IP ADDRESS
 # ============================================================
@@ -160,7 +150,6 @@ def get_ip_address():
     finally:
         s.close()
     return ip
-
 
 # ============================================================
 #   WEB SERVER LOOP
@@ -192,7 +181,6 @@ try:
                 target_angle = (level / 100) * 360
 
                 motor = m1 if idx == 0 else m2
-
                 p = motor.goAngle(target_angle)
                 p.join()
 
