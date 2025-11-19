@@ -1,5 +1,5 @@
 # ============================================================
-#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Self-contained)
+#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM (Single-process motors)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -10,7 +10,7 @@ import time
 from shifter import Shifter
 
 # ============================================================
-#   STEPPER CLASS (Direct angle movement, no switching)
+#   STEPPER CLASS (Single background process per motor)
 # ============================================================
 
 class Stepper:
@@ -22,17 +22,22 @@ class Stepper:
 
     def __init__(self, shifter, lock):
         self.s = shifter
+        self.lock = lock
         self.angle = multiprocessing.Value('d', 0.0)
+        self.target_angle = multiprocessing.Value('d', 0.0)
         self.step_state = 0
         self.shifter_bit_start = 4 * Stepper.num_steppers
-        self.lock = lock
-        self.process = None
         Stepper.num_steppers += 1
 
-    def __sgn(self, x):
+        # Start background process
+        self.process = multiprocessing.Process(target=self._motor_loop)
+        self.process.daemon = True
+        self.process.start()
+
+    def _sgn(self, x):
         return 0 if x == 0 else int(abs(x) / x)
 
-    def __step(self, direction):
+    def _step(self, direction):
         self.step_state = (self.step_state + direction) % 8
         Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
         Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
@@ -42,34 +47,30 @@ class Stepper:
             self.angle.value += direction / Stepper.steps_per_degree
             self.angle.value %= 360
 
-    def __rotate(self, delta):
-        steps = int(abs(delta) * Stepper.steps_per_degree)
-        direction = self.__sgn(delta)
-        for _ in range(steps):
-            self.__step(direction)
-            time.sleep(Stepper.delay / 1e6)
+    def _motor_loop(self):
+        while True:
+            with self.angle.get_lock():
+                current = self.angle.value
+            with self.target_angle.get_lock():
+                target = self.target_angle.value
 
-    def rotate(self, delta):
-        # Stop existing process if running
-        if self.process is not None and self.process.is_alive():
-            self.process.terminate()
-            self.process.join()
+            delta = target - current
+            if abs(delta) >= 0.1:  # tolerance to prevent jitter
+                direction = 1 if delta > 0 else -1
+                self._step(direction)
+                time.sleep(Stepper.delay / 1e6)
+            else:
+                time.sleep(0.01)
 
-        self.process = multiprocessing.Process(target=self.__rotate, args=(delta,))
-        self.process.start()
-        return self.process
-
-    def goAngle(self, target_angle):
-        target_angle = float(target_angle) % 360
-        with self.angle.get_lock():
-            current = float(self.angle.value)
-
-        delta = target_angle - current  # direct movement, no wrap
-        return self.rotate(delta)
+    def goAngle(self, angle):
+        with self.target_angle.get_lock():
+            self.target_angle.value = angle % 360
 
     def zero(self):
         with self.angle.get_lock():
             self.angle.value = 0.0
+        with self.target_angle.get_lock():
+            self.target_angle.value = 0.0
 
 # ============================================================
 #   SETUP SHIFT REGISTER + MOTORS
@@ -181,8 +182,7 @@ try:
                 target_angle = (level / 100) * 360
 
                 motor = m1 if idx == 0 else m2
-                p = motor.goAngle(target_angle)
-                p.join()
+                motor.goAngle(target_angle)
 
                 print(f"Motor {idx+1} → {target_angle:.2f}°")
 
