@@ -1,10 +1,8 @@
 import requests
-import json
 
 url = "http://192.168.1.254:8000/positions.json"
+data = requests.get(url).json()
 
-response = requests.get(url)
-data = response.json()     # this is now a Python dict
-
-print(data)
-
+t14 = data["turrets"]["14"]
+r14 = t14["r"]
+theta14 = t14["theta"]
