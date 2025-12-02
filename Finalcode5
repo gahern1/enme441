@@ -1,0 +1,210 @@
+# ============================================================
+#  FULL WEB + SLIDER + STEPPER CONTROL SYSTEM
+#  Integer-step approach (no extra rotations)
+# ============================================================
+
+import RPi.GPIO as GPIO
+import socket
+from urllib.parse import parse_qs
+import multiprocessing
+import time
+from shifter import Shifter
+
+# ============================================================
+#   STEPPER CLASS (Integer-step counting, shortest-path)
+# ============================================================
+
+class Stepper:
+    num_steppers = 0
+    shifter_outputs = 0
+    seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
+    delay = 1200
+    steps_per_degree = 4096 / 360  # steps per degree
+
+    def __init__(self, shifter, lock):
+        self.s = shifter
+        self.lock = lock  # lock to prevent race conditions
+        self.steps_taken = multiprocessing.Value('i', 0)  # track absolute integer steps
+        self.target_angle = multiprocessing.Value('d', 0.0)
+
+        # FIX 1: Give each motor a unique starting phase
+        self.step_state = Stepper.num_steppers % 8
+
+        # FIX 2: Correct bit mapping for your wiring (0–3 for m1, 4–7 for m2)
+        self.shifter_bit_start = 4 * Stepper.num_steppers
+
+        Stepper.num_steppers += 1
+
+        # start background process
+        self.process = multiprocessing.Process(target=self._motor_loop)
+        self.process.daemon = True
+        self.process.start()
+
+    def _current_angle(self):
+        with self.steps_taken.get_lock():
+            return (self.steps_taken.value / Stepper.steps_per_degree) % 360
+
+    def _step(self, direction):
+        self.step_state = (self.step_state + direction) % 8
+
+        # update shift register safely
+        with self.lock:
+            Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
+            Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
+            self.s.shiftByte(Stepper.shifter_outputs)
+
+        # increment integer steps
+        with self.steps_taken.get_lock():
+            self.steps_taken.value += direction
+
+    def _motor_loop(self):
+        while True:
+            current = self._current_angle()
+            with self.target_angle.get_lock():
+                target = self.target_angle.value
+
+            # shortest-path delta in degrees
+            delta_deg = (target - current + 180) % 360 - 180
+            if abs(delta_deg) >= (1 / Stepper.steps_per_degree):  # at least 1 step
+                direction = 1 if delta_deg > 0 else -1
+                self._step(direction)
+                time.sleep(Stepper.delay / 1e6)
+            else:
+                time.sleep(0.01)
+
+    def goAngle(self, angle):
+        with self.target_angle.get_lock():
+            self.target_angle.value = angle % 360
+
+    def zero(self):
+        with self.steps_taken.get_lock():
+            self.steps_taken.value = 0
+        with self.target_angle.get_lock():
+            self.target_angle.value = 0.0
+
+        # keep unique stepping phase, don't reset it
+        # reset outputs only
+        self.step_state = self.step_state % 8
+
+
+# ============================================================
+#   SETUP SHIFT REGISTER + MOTORS
+# ============================================================
+
+GPIO.setmode(GPIO.BCM)
+
+s = Shifter(data=16, latch=20, clock=21)
+lock = multiprocessing.Lock()
+
+m1 = Stepper(s, lock)
+m2 = Stepper(s, lock)
+
+m1.zero()
+m2.zero()
+
+slider_vals = [0, 0]
+
+# ============================================================
+#   HTML PAGE
+# ============================================================
+
+def html_page():
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Stepper Controller</title>
+  <style>
+    body {{ font-family: Arial; text-align: center; margin-top: 40px; }}
+    .slider-container {{ margin: 25px auto; width: 300px; }}
+    input[type=range] {{ width: 100%; }}
+  </style>
+</head>
+<body>
+
+<h2>Stepper Motor Angle Controller</h2>
+
+<div class="slider-container">
+  <label>Motor 1 Angle</label><br>
+  <input type="range" min="0" max="100" value="{slider_vals[0]}" id="motor0" oninput="updateMotor(0)">
+  <span id="val0">{slider_vals[0]}</span>
+</div>
+
+<div class="slider-container">
+  <label>Motor 2 Angle</label><br>
+  <input type="range" min="0" max="100" value="{slider_vals[1]}" id="motor1" oninput="updateMotor(1)">
+  <span id="val1">{slider_vals[1]}</span>
+</div>
+
+<script>
+function updateMotor(idx) {{
+    let val = document.getElementById("motor" + idx).value;
+    document.getElementById("val" + idx).innerHTML = val;
+
+    fetch("/", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
+      body: "motor=" + idx + "&level=" + val
+    }});
+}}
+</script>
+
+</body>
+</html>"""
+
+# ============================================================
+#   GET IP ADDRESS
+# ============================================================
+
+def get_ip_address():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+# ============================================================
+#   WEB SERVER LOOP
+# ============================================================
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('', 8080))
+server.listen(1)
+
+print(f"🌐 Control motors at: http://{get_ip_address()}:8080")
+
+try:
+    while True:
+        conn, addr = server.accept()
+        request = conn.recv(2048).decode()
+        if not request:
+            conn.close()
+            continue
+
+        if "POST" in request:
+            body = request.split("\r\n\r\n")[-1]
+            params = parse_qs(body)
+
+            if "motor" in params and "level" in params:
+                idx = int(params["motor"][0])
+                level = int(params["level"][0])
+
+                slider_vals[idx] = level
+                target_angle = (level / 100) * 360
+
+                motor = m1 if idx == 0 else m2
+                motor.goAngle(target_angle)
+
+                print(f"Motor {idx+1} → {target_angle:.2f}°")
+
+        conn.sendall(("HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()).encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("\nShutting Down...")
+    GPIO.cleanup()
+    server.close()
