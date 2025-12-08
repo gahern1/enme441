@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================
-# IoT Laser Turret — Final (fixed)
-# - Motor 1 (AZ) -> shift register bits 4-7
-# - Motor 2 (EL) -> shift register bits 0-3
-# - Threaded motor loops (no multiprocessing)
-# - goAngle uses shortest-path immediately (no extra rotations)
-# - JSON targeting + laser firing included
-# - Prints JSON at startup (Option A)
+# IoT Laser Turret — AZ/EL Swap Corrected
+# - Motor 1 (EL) -> shift register bits 4-7
+# - Motor 2 (AZ) -> shift register bits 0-3
+# - Threaded motor loops
+# - goAngle uses shortest-path immediately
+# - JSON printed at startup
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -21,22 +20,21 @@ import threading
 import sys
 
 # ==================== CONFIG ====================
-TEAM_ID = 14                 # <-- your team number
+TEAM_ID = 14
 POSITIONS_URL = "http://192.168.1.254:8000/positions.json"
-LASER_PIN = 18               # BCM pin used to switch laser (via transistor or resistor)
-LASER_FIRE_DURATION = 3.0    # seconds laser is on for each firing event
-TARGET_TOLERANCE_DEG = 1.0   # tolerance used to decide motor has reached target
-MOTOR_STEP_DELAY_US = 1200   # microseconds delay between microsteps (controls speed/torque)
+LASER_PIN = 18
+LASER_FIRE_DURATION = 3.0
+TARGET_TOLERANCE_DEG = 1.0
+MOTOR_STEP_DELAY_US = 1200
 # =================================================
 
 # ============================================================
-# Stepper class (threaded motor loop, explicit bit_start mapping)
+# Stepper class
 # ============================================================
 
 class Stepper:
     seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
     steps_per_degree = 4096.0 / 360.0
-
     shifter_outputs = 0
     shifter_lock = threading.Lock()
 
@@ -111,8 +109,9 @@ class Stepper:
 GPIO.setmode(GPIO.BCM)
 s = Shifter(data=16, latch=20, clock=21)
 
-m1 = Stepper(s, bit_start=4, name="AZ")
-m2 = Stepper(s, bit_start=0, name="EL")
+# Swap AZ/EL motors
+m1 = Stepper(s, bit_start=4, name="EL")   # Motor 1 = Elevation
+m2 = Stepper(s, bit_start=0, name="AZ")   # Motor 2 = Azimuth
 m1.zero()
 m2.zero()
 
@@ -218,20 +217,20 @@ def run_targeting_sequence_thread():
     for t in targets:
         az_deg, el_deg = compute_target_angles(my_r, my_theta, t)
         print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
-        m1.goAngle(az_deg)
-        m2.goAngle(el_deg)
+        m2.goAngle(az_deg)  # AZ = m2
+        m1.goAngle(el_deg)  # EL = m1
         t0 = time.time()
         timeout = 10.0
         while True:
-            cur_az = m1._current_angle()
-            cur_el_raw = m2._current_angle()
+            cur_az = m2._current_angle()
+            cur_el_raw = m1._current_angle()
             cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
             diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
             diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
             if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
                 break
             if time.time() - t0 > timeout:
-                print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}")
+                print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}°")
                 break
             time.sleep(0.02)
         print("[FIRE] Laser ON")
@@ -278,13 +277,13 @@ def html_page():
   </div>
 
   <div class="slider">
-    <label>Motor 1 (Azimuth): <span id="azval">{slider_vals[0]:.1f}</span>°</label><br>
+    <label>Motor 1 (Elevation): <span id="elval">{slider_vals[0]:.1f}</span>°</label><br>
     <input id="motor0" type="range" min="0" max="360" value="{slider_vals[0]}" oninput="updateMotor(0)">
   </div>
 
   <div class="slider">
-    <label>Motor 2 (Elevation): <span id="elval">{slider_vals[1]:.1f}</span>°</label><br>
-    <input id="motor1" type="range" min="-90" max="90" value="{slider_vals[1]}" oninput="updateMotor(1)">
+    <label>Motor 2 (Azimuth): <span id="azval">{slider_vals[1]:.1f}</span>°</label><br>
+    <input id="motor1" type="range" min="0" max="360" value="{slider_vals[1]}" oninput="updateMotor(1)">
   </div>
 
   <div class="status">
@@ -295,8 +294,8 @@ def html_page():
 <script>
 function updateMotor(idx) {{
   let val = document.getElementById("motor"+idx).value;
-  if (idx==0) document.getElementById("azval").innerText = val;
-  else document.getElementById("elval").innerText = val;
+  if (idx==0) document.getElementById("elval").innerText = val;
+  else document.getElementById("azval").innerText = val;
   fetch("/", {{
     method:"POST",
     headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
@@ -359,10 +358,10 @@ try:
                 slider_vals[idx] = level
                 if idx == 0:
                     m1.goAngle(level)
-                    print(f"[UI] Manual AZ set to {level:.2f}°")
+                    print(f"[UI] Manual EL set to {level:.2f}°")
                 else:
                     m2.goAngle(level)
-                    print(f"[UI] Manual EL set to {level:.2f}°")
+                    print(f"[UI] Manual AZ set to {level:.2f}°")
 
             if "action" in params:
                 action = params["action"][0]
