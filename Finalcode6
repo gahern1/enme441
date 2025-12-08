@@ -1,123 +1,160 @@
+#!/usr/bin/env python3
 # ============================================================
-#  FULL WEB + SLIDER + STEPPER + JSON TARGETING (Option B)
-#  Motor mapping: m1 = AZIMUTH, m2 = ELEVATION
-#  TEAM_ID set to 14
+# IoT Laser Turret — Final (fixed)
+# - Motor 1 (AZ) -> shift register bits 4-7
+# - Motor 2 (EL) -> shift register bits 0-3
+# - Threaded motor loops (no multiprocessing)
+# - goAngle uses shortest-path immediately (no extra rotations)
+# - JSON targeting + laser firing included
 # ============================================================
 
 import RPi.GPIO as GPIO
 import socket
 from urllib.parse import parse_qs
-import multiprocessing
 import time
 from shifter import Shifter
 import json
 import urllib.request
 import math
 import threading
+import sys
 
 # ==================== CONFIG ====================
-TEAM_ID = 14                # <-- your team number
+TEAM_ID = 14                 # <-- your team number
 POSITIONS_URL = "http://192.168.1.254:8000/positions.json"
-LASER_PIN = 18              # BCM pin used to switch laser (via transistor or resistor)
-LASER_FIRE_DURATION = 3.0   # seconds laser is on for each firing event
-TARGET_TOLERANCE_DEG = 1.0  # consider motor at target when within this many degrees
+LASER_PIN = 18               # BCM pin used to switch laser (via transistor or resistor)
+LASER_FIRE_DURATION = 3.0    # seconds laser is on for each firing event
+TARGET_TOLERANCE_DEG = 1.0   # tolerance used to decide motor has reached target
+MOTOR_STEP_DELAY_US = 1200   # microseconds delay between microsteps (controls speed/torque)
 # =================================================
 
 # ============================================================
-#   STEPPER CLASS (Integer-step counting, shortest-path)
+# Stepper class (threaded motor loop, explicit bit_start mapping)
+# - bit_start is the LSB index in the 8-bit shift register where this motor's 4 bits begin.
+#   e.g., bit_start=4 -> uses bits 4,5,6,7; bit_start=0 -> uses bits 0,1,2,3
+# - steps are integer micro-steps; steps_per_degree used to convert to/from degrees
 # ============================================================
 
 class Stepper:
-    num_steppers = 0
-    shifter_outputs = 0
     seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
-    delay = 1200
-    steps_per_degree = 4096.0 / 360.0  # steps per degree (float)
+    steps_per_degree = 4096.0 / 360.0  # 4096 steps per revolution example (adjust if different)
 
-    def __init__(self, shifter, lock):
+    # global shifter output cached so multiple steppers can combine their nybbles
+    shifter_outputs = 0
+    shifter_lock = threading.Lock()  # protects Stepper.shifter_outputs and actual shifting
+
+    def __init__(self, shifter, bit_start, name=""):
+        """
+        shifter : Shifter instance with .shiftByte(byte)
+        bit_start : integer 0..4 (start bit index for the 4-bit motor field)
+        name : optional label for debugging
+        """
         self.s = shifter
-        self.lock = lock  # lock to prevent race conditions
-        self.steps_taken = multiprocessing.Value('i', 0)  # track absolute integer steps
-        self.target_angle = multiprocessing.Value('d', 0.0)
+        self.bit_start = int(bit_start)
+        self.name = name or f"motor@{bit_start}"
+        self._steps_lock = threading.Lock()
+        self.steps_taken = 0  # integer microsteps (can be negative historically)
+        self._target_lock = threading.Lock()
+        self.target_angle_deg = 0.0  # stored as absolute degrees (not steps) but may exceed 360
+        self._step_state = 0  # index into seq for which pattern currently on the motor (0..7)
 
-        # Give each motor a unique starting phase
-        self.step_state = Stepper.num_steppers % 8
-
-        # Map first created Stepper -> bits 0-3, second -> 4-7
-        self.shifter_bit_start = 4 * Stepper.num_steppers
-
-        Stepper.num_steppers += 1
-
-        # start background process
-        self.process = multiprocessing.Process(target=self._motor_loop)
-        self.process.daemon = True
-        self.process.start()
+        # start motor thread
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._motor_loop, daemon=True)
+        self._thread.start()
 
     def _current_angle(self):
-        with self.steps_taken.get_lock():
-            ang = (self.steps_taken.value / Stepper.steps_per_degree) % 360.0
+        # Convert integer steps -> angle (0..360)
+        with self._steps_lock:
+            ang = (self.steps_taken / Stepper.steps_per_degree) % 360.0
             if ang < 0:
                 ang += 360.0
             return ang
 
-    def _step(self, direction):
-        self.step_state = (self.step_state + direction) % 8
-
-        # update shift register safely
-        with self.lock:
-            Stepper.shifter_outputs &= ~(0b1111 << self.shifter_bit_start)
-            Stepper.shifter_outputs |= (Stepper.seq[self.step_state] << self.shifter_bit_start)
+    def _write_shifter_nybble(self):
+        # Compose the full 8-bit byte and write using the shared lock
+        with Stepper.shifter_lock:
+            Stepper.shifter_outputs &= ~(0b1111 << self.bit_start)
+            Stepper.shifter_outputs |= (Stepper.seq[self._step_state] << self.bit_start)
             self.s.shiftByte(Stepper.shifter_outputs)
 
-        # increment integer steps
-        with self.steps_taken.get_lock():
-            self.steps_taken.value += direction
+    def _step_micro(self, direction):
+        # direction: +1 or -1 (one microstep index change)
+        self._step_state = (self._step_state + direction) % len(Stepper.seq)
+        # write to the shift register
+        self._write_shifter_nybble()
+        # update integer step counter
+        with self._steps_lock:
+            self.steps_taken += direction
 
     def _motor_loop(self):
-        while True:
+        # Continuously move towards target angle using shortest-path logic.
+        while not self._stop_event.is_set():
             current = self._current_angle()
-            with self.target_angle.get_lock():
-                target = self.target_angle.value
-
-            # shortest-path delta in degrees
-            delta_deg = (target - current + 180.0) % 360.0 - 180.0
+            with self._target_lock:
+                target = self.target_angle_deg  # may be any real number (we normalize below)
+            # compute shortest-path delta (in degrees)
+            # normalize target to nearest equivalent angle around current:
+            desired = target % 360.0
+            delta = (desired - current + 180.0) % 360.0 - 180.0  # in (-180,180]
             step_threshold = 1.0 / Stepper.steps_per_degree
-            if abs(delta_deg) >= (step_threshold):
-                direction = 1 if delta_deg > 0 else -1
-                self._step(direction)
-                time.sleep(Stepper.delay / 1e6)
+            if abs(delta) >= step_threshold:
+                direction = 1 if delta > 0 else -1
+                self._step_micro(direction)
+                # microstep delay
+                time.sleep(MOTOR_STEP_DELAY_US / 1e6)
             else:
-                time.sleep(0.01)
+                time.sleep(0.008)  # idle small sleep to reduce CPU usage
 
     def goAngle(self, angle_deg):
-        """Set absolute target angle in degrees (0-360)."""
-        with self.target_angle.get_lock():
-            self.target_angle.value = angle_deg % 360.0
+        """
+        Command an absolute angle (in degrees). This method chooses the equivalent angle
+        that yields the shortest rotation from the motor's current angle — so the motor
+        will never Spin > 180 degrees to reach a target.
+        angle_deg can be any real number (negative allowed); internally mapped to nearest
+        equivalent of that angle relative to current motor position.
+        """
+        with self._target_lock:
+            cur = self._current_angle()
+            desired = float(angle_deg) % 360.0
+            delta = (desired - cur + 180.0) % 360.0 - 180.0
+            # choose target equal to current + delta (this is the nearest equivalent)
+            target = cur + delta
+            # store the absolute target degree (keeping it within reasonable range)
+            self.target_angle_deg = target
+        # immediate return; motor thread will move towards target
 
     def zero(self):
-        """Set current step count to represent 0 degrees; keep phase."""
-        with self.steps_taken.get_lock():
-            self.steps_taken.value = 0
-        with self.target_angle.get_lock():
-            self.target_angle.value = 0.0
+        # make current position read as 0 degrees (but keep internal step_state)
+        with self._steps_lock:
+            self.steps_taken = 0
+        with self._target_lock:
+            self.target_angle_deg = 0.0
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
 
 # ============================================================
-#   SETUP SHIFT REGISTER + MOTORS + LASER GPIO
+# Hardware setup: GPIO, shift register, motors, laser
 # ============================================================
 
 GPIO.setmode(GPIO.BCM)
 
-# Initialize shifter (use your pins)
+# create the shifter instance (pins may be different on your setup)
 s = Shifter(data=16, latch=20, clock=21)
-lock = multiprocessing.Lock()
 
-m1 = Stepper(s, lock)  # motor 1 -> AZIMUTH
-m2 = Stepper(s, lock)  # motor 2 -> ELEVATION
+# Create steppers with explicit bit_start:
+# Motor 1 (az) uses bits 4..7 -> bit_start = 4
+# Motor 2 (el) uses bits 0..3 -> bit_start = 0
+m1 = Stepper(s, bit_start=4, name="AZ")  # motor 1 -> AZIMUTH
+m2 = Stepper(s, bit_start=0, name="EL")  # motor 2 -> ELEVATION
 
+# Initialize both to zero position (software zero)
 m1.zero()
 m2.zero()
 
-# Laser output pin setup
+# Laser setup
 GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 def laser_on():
@@ -128,13 +165,13 @@ def laser_off():
 
 laser_off()
 
-# Shared UI values (simple local state)
-slider_vals = [0.0, 0.0]  # degrees for UI display
+# UI state
+slider_vals = [0.0, 0.0]   # motor 1 (az), motor 2 (el)
 status_lock = threading.Lock()
 run_state = {"running": False, "last_error": ""}
 
 # ============================================================
-#   GEOMETRY: polar->cartesian and angle computations
+# Geometry helpers
 # ============================================================
 
 def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
@@ -145,9 +182,10 @@ def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
 
 def compute_target_angles(my_r, my_theta, target):
     """
-    target: dict with r (cm), theta (rad), optionally z (cm)
-    returns (azimuth_deg, elevation_deg)
-    azimuth_deg in 0..360, elevation_deg in -90..+90
+    target: dict with keys r (cm), theta (rad), optional z (cm)
+    Returns: (azimuth_deg, elevation_deg)
+      - azimuth_deg: 0..360 absolute (direction from turret to target)
+      - elevation_deg: -90..+90 degrees above horizontal
     """
     tx = float(target["r"])
     ttheta = float(target["theta"])
@@ -160,17 +198,17 @@ def compute_target_angles(my_r, my_theta, target):
     dy = t_y - my_y
     dz = t_z - my_z
 
-    azimuth_rad = math.atan2(dy, dx)
-    azimuth_deg = math.degrees(azimuth_rad) % 360.0
+    az_rad = math.atan2(dy, dx)
+    az_deg = (math.degrees(az_rad)) % 360.0
 
-    horizontal_dist = math.hypot(dx, dy)
-    elevation_rad = math.atan2(dz, horizontal_dist)
-    elevation_deg = math.degrees(elevation_rad)
+    horiz = math.hypot(dx, dy)
+    el_rad = math.atan2(dz, horiz)
+    el_deg = math.degrees(el_rad)  # -90..+90
 
-    return azimuth_deg, elevation_deg
+    return az_deg, el_deg
 
 # ============================================================
-#   JSON fetching
+# JSON fetching
 # ============================================================
 
 def fetch_positions(url, timeout=5.0):
@@ -182,7 +220,7 @@ def fetch_positions(url, timeout=5.0):
         raise RuntimeError(f"Failed to fetch positions.json: {e}")
 
 # ============================================================
-#   TARGETING SEQUENCE (threaded runner)
+# Targeting sequence (threaded runner using m1,m2 objects)
 # ============================================================
 
 def run_targeting_sequence_thread():
@@ -196,7 +234,7 @@ def run_targeting_sequence_thread():
         with status_lock:
             run_state["running"] = False
             run_state["last_error"] = str(e)
-        print("Error fetching positions:", e)
+        print("[ERROR] fetching positions:", e)
         return
 
     turrets = data.get("turrets", {})
@@ -205,15 +243,15 @@ def run_targeting_sequence_thread():
         with status_lock:
             run_state["running"] = False
             run_state["last_error"] = err
-        print(err)
+        print("[ERROR]", err)
         return
 
     my_entry = turrets[str(TEAM_ID)]
     my_r = float(my_entry["r"])
     my_theta = float(my_entry["theta"])
 
-    # Build target list: other turrets (exclude self) and globes
     targets = []
+    # other turrets (z = 0)
     for tid, info in turrets.items():
         if int(tid) == TEAM_ID:
             continue
@@ -225,53 +263,52 @@ def run_targeting_sequence_thread():
             "z": 0.0
         })
 
-    globes = data.get("globes", [])
-    for gi, g in enumerate(globes):
+    # globes
+    for gi, g in enumerate(data.get("globes", [])):
         targets.append({
             "type": "globe",
             "id": gi,
             "r": float(g["r"]),
             "theta": float(g["theta"]),
-            "z": float(g["z"])
+            "z": float(g.get("z", 0.0))
         })
 
-    print(f"[TARGETING] {len(targets)} targets found.")
+    print(f"[TARGETING] Found {len(targets)} targets.")
 
     for t in targets:
         az_deg, el_deg = compute_target_angles(my_r, my_theta, t)
         print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
 
-        # Command motors (m1 -> azimuth, m2 -> elevation)
+        # Command motors:
+        # m1 -> azimuth (0..360)
         m1.goAngle(az_deg)
-        # convert elevation (-90..90) to a 0..360 motor angle if needed:
-        # We will map elevation into 0..360 such that motor's zero=0deg horizontal,
-        # positive elevation is a positive motor rotation from that zero.
-        # If your elevation motor expects a different range, adapt here.
-        m2_target = (el_deg + 360.0) % 360.0
-        m2.goAngle(m2_target)
 
-        # Wait until target reached or timeout
-        start_wait = time.time()
+        # For elevation, m2.goAngle accepts angles in degrees; we pass el_deg directly
+        # el_deg is in -90..+90. goAngle will pick the closest equivalent (so it'll move minimal)
+        m2.goAngle(el_deg)
+
+        # Wait until motors within tolerance, or timeout
+        t0 = time.time()
         timeout = 10.0
         while True:
             cur_az = m1._current_angle()
             cur_el_raw = m2._current_angle()
-            # convert raw el motor angle back to -180..180 centered
+            # convert raw el into -180..180 for comparison, then into -180..180 centered
             cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
             diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
             diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
             if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
                 break
-            if time.time() - start_wait > timeout:
-                print(f"[WARN] Motor timeout reaching target az={az_deg:.2f}, el={el_deg:.2f}")
+            if time.time() - t0 > timeout:
+                print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}")
                 break
             time.sleep(0.02)
 
         # Fire laser exactly LASER_FIRE_DURATION seconds
         print("[FIRE] Laser ON")
         laser_on()
-        t0 = time.time()
-        while time.time() - t0 < LASER_FIRE_DURATION:
+        t_fire_start = time.time()
+        while time.time() - t_fire_start < LASER_FIRE_DURATION:
             time.sleep(0.01)
         laser_off()
         print("[FIRE] Laser OFF")
@@ -281,7 +318,7 @@ def run_targeting_sequence_thread():
     print("[TARGETING] Sequence complete.")
 
 # ============================================================
-#   HTML PAGE (buttons + sliders)
+# Simple HTML page with manual controls & sequence start
 # ============================================================
 
 def html_page():
@@ -290,67 +327,68 @@ def html_page():
         last_err = run_state["last_error"]
     return f"""<!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><title>Turret Controller - Team {TEAM_ID}</title>
-<style>
-  body {{ font-family: Arial; text-align: center; margin-top: 20px; }}
-  .slider-container {{ margin: 15px auto; width: 360px; }}
-  input[type=range] {{ width: 100%; }}
-  button {{ padding: 8px 14px; margin: 6px; }}
-  .status {{ margin-top: 12px; color: #333; }}
-</style></head>
+<head>
+  <meta charset="UTF-8">
+  <title>Turret Controller — Team {TEAM_ID}</title>
+  <style>
+    body {{ font-family: Arial; text-align:center; margin-top:20px; }}
+    .slider {{ width:360px; margin:12px auto; }}
+    input[type=range] {{ width:100%; }}
+    button {{ padding:8px 14px; margin:6px; }}
+    .status {{ margin-top:12px; }}
+  </style>
+</head>
 <body>
-<h2>IoT Laser Turret — Team {TEAM_ID}</h2>
+  <h2>IoT Laser Turret — Team {TEAM_ID}</h2>
 
-<div>
-  <button onclick="postAction('laser_on')">Laser ON</button>
-  <button onclick="postAction('laser_off')">Laser OFF</button>
-  <button onclick="postAction('zero')">Zero Motors</button>
-  <button onclick="postAction('start_sequence')">Start Targeting Sequence</button>
-</div>
+  <div>
+    <button onclick="postAction('laser_on')">Laser ON</button>
+    <button onclick="postAction('laser_off')">Laser OFF</button>
+    <button onclick="postAction('zero')">Zero Motors</button>
+    <button onclick="postAction('start_sequence')">Start Targeting Sequence</button>
+  </div>
 
-<div class="slider-container">
-  <label>Motor 1 (Azimuth) — {slider_vals[0]:.1f}°</label><br>
-  <input type="range" min="0" max="360" value="{slider_vals[0]}" id="motor0" oninput="updateMotor(0)">
-  <span id="val0">{slider_vals[0]}</span>
-</div>
+  <div class="slider">
+    <label>Motor 1 (Azimuth): <span id="azval">{slider_vals[0]:.1f}</span>°</label><br>
+    <input id="motor0" type="range" min="0" max="360" value="{slider_vals[0]}" oninput="updateMotor(0)">
+  </div>
 
-<div class="slider-container">
-  <label>Motor 2 (Elevation) — {slider_vals[1]:.1f}°</label><br>
-  <input type="range" min="-90" max="90" value="{slider_vals[1]}" id="motor1" oninput="updateMotor(1)">
-  <span id="val1">{slider_vals[1]}</span>
-</div>
+  <div class="slider">
+    <label>Motor 2 (Elevation): <span id="elval">{slider_vals[1]:.1f}</span>°</label><br>
+    <input id="motor1" type="range" min="-90" max="90" value="{slider_vals[1]}" oninput="updateMotor(1)">
+  </div>
 
-<div class="status">
-  <strong>Sequence running:</strong> {running} <br>
-  <strong>Last error:</strong> {last_err}
-</div>
+  <div class="status">
+    <strong>Sequence running:</strong> {running} <br>
+    <strong>Last error:</strong> {last_err}
+  </div>
 
 <script>
 function updateMotor(idx) {{
-    let val = document.getElementById("motor" + idx).value;
-    document.getElementById("val" + idx).innerHTML = val;
-    fetch("/", {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-      body: "motor=" + idx + "&level=" + val
-    }});
+  let val = document.getElementById("motor"+idx).value;
+  if (idx==0) document.getElementById("azval").innerText = val;
+  else document.getElementById("elval").innerText = val;
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "motor="+idx+"&level="+val
+  }});
 }}
 
 function postAction(action) {{
-    fetch("/", {{
-      method: "POST",
-      headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-      body: "action=" + action
-    }});
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "action="+action
+  }});
 }}
 </script>
-
-</body></html>"""
+</body>
+</html>"""
 
 # ============================================================
-#   GET IP ADDRESS
+# Utility: get local IP (for user to access web UI)
 # ============================================================
-
 def get_ip_address():
     sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -363,67 +401,77 @@ def get_ip_address():
     return ip
 
 # ============================================================
-#   WEB SERVER LOOP
+# Simple blocking socket web server (keeps everything single-process)
 # ============================================================
-
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('', 8080))
 server.listen(1)
 
-print(f"🌐 Control turret at: http://{get_ip_address()}:8080")
+print(f"🚀 Turret UI: http://{get_ip_address()}:8080")
+print("Press Ctrl-C to stop and cleanup")
 
 try:
     while True:
         conn, addr = server.accept()
-        request = conn.recv(4096).decode(errors="ignore")
+        request = conn.recv(8192).decode(errors='ignore')
         if not request:
             conn.close()
             continue
 
-        if "POST" in request.splitlines()[0]:
+        # handle POST bodies
+        if request.startswith("POST"):
             body = request.split("\r\n\r\n", 1)[-1]
             params = parse_qs(body)
 
+            # slider controls
             if "motor" in params and "level" in params:
                 idx = int(params["motor"][0])
                 level = float(params["level"][0])
                 slider_vals[idx] = level
-
                 if idx == 0:
-                    # azimuth slider uses 0..360 directly
-                    motor_target = level % 360.0
-                    m1.goAngle(motor_target)
+                    # azimuth: pass 0..360
+                    m1.goAngle(level)
+                    print(f"[UI] Manual AZ set to {level:.2f}°")
                 else:
-                    # elevation slider gives -90..90; map to motor angle space
-                    # here we map elevation e (-90..90) -> motor angle (e mod 360)
-                    # adjust mapping if your elevation motor zero differs physically
-                    motor_target = (level + 360.0) % 360.0
-                    m2.goAngle(motor_target)
-                print(f"Manual: Motor {idx+1} → {level:.2f}")
+                    # elevation: pass -90..90 (goAngle handles nearest equivalent)
+                    m2.goAngle(level)
+                    print(f"[UI] Manual EL set to {level:.2f}°")
 
+            # action buttons
             if "action" in params:
                 action = params["action"][0]
                 if action == "laser_on":
-                    laser_on(); print("Laser ON (manual)")
+                    laser_on()
+                    print("[UI] Laser ON (manual)")
                 elif action == "laser_off":
-                    laser_off(); print("Laser OFF (manual)")
+                    laser_off()
+                    print("[UI] Laser OFF (manual)")
                 elif action == "zero":
-                    m1.zero(); m2.zero(); print("Motors zeroed")
+                    m1.zero(); m2.zero()
+                    print("[UI] Motors zeroed (software)")
                 elif action == "start_sequence":
                     with status_lock:
                         if run_state["running"]:
-                            print("Sequence already running")
+                            print("[UI] Sequence already running")
                         else:
-                            print("Starting targeting sequence")
+                            print("[UI] Starting targeting sequence thread")
                             t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
                             t.start()
 
+        # Serve page
         response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
         conn.sendall(response.encode())
         conn.close()
 
 except KeyboardInterrupt:
-    print("\nShutting Down...")
-    laser_off()
+    print("\nShutting down...")
+    try:
+        laser_off()
+        # stop motor threads
+        m1.stop()
+        m2.stop()
+    except Exception:
+        pass
     GPIO.cleanup()
     server.close()
+    sys.exit(0)
