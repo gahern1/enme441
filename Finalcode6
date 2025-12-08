@@ -6,6 +6,7 @@
 # - Threaded motor loops (no multiprocessing)
 # - goAngle uses shortest-path immediately (no extra rotations)
 # - JSON targeting + laser firing included
+# - Prints JSON at startup (Option A)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -30,41 +31,29 @@ MOTOR_STEP_DELAY_US = 1200   # microseconds delay between microsteps (controls s
 
 # ============================================================
 # Stepper class (threaded motor loop, explicit bit_start mapping)
-# - bit_start is the LSB index in the 8-bit shift register where this motor's 4 bits begin.
-#   e.g., bit_start=4 -> uses bits 4,5,6,7; bit_start=0 -> uses bits 0,1,2,3
-# - steps are integer micro-steps; steps_per_degree used to convert to/from degrees
 # ============================================================
 
 class Stepper:
     seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
-    steps_per_degree = 4096.0 / 360.0  # 4096 steps per revolution example (adjust if different)
+    steps_per_degree = 4096.0 / 360.0
 
-    # global shifter output cached so multiple steppers can combine their nybbles
     shifter_outputs = 0
-    shifter_lock = threading.Lock()  # protects Stepper.shifter_outputs and actual shifting
+    shifter_lock = threading.Lock()
 
     def __init__(self, shifter, bit_start, name=""):
-        """
-        shifter : Shifter instance with .shiftByte(byte)
-        bit_start : integer 0..4 (start bit index for the 4-bit motor field)
-        name : optional label for debugging
-        """
         self.s = shifter
         self.bit_start = int(bit_start)
         self.name = name or f"motor@{bit_start}"
         self._steps_lock = threading.Lock()
-        self.steps_taken = 0  # integer microsteps (can be negative historically)
+        self.steps_taken = 0
         self._target_lock = threading.Lock()
-        self.target_angle_deg = 0.0  # stored as absolute degrees (not steps) but may exceed 360
-        self._step_state = 0  # index into seq for which pattern currently on the motor (0..7)
-
-        # start motor thread
+        self.target_angle_deg = 0.0
+        self._step_state = 0
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._motor_loop, daemon=True)
         self._thread.start()
 
     def _current_angle(self):
-        # Convert integer steps -> angle (0..360)
         with self._steps_lock:
             ang = (self.steps_taken / Stepper.steps_per_degree) % 360.0
             if ang < 0:
@@ -72,60 +61,40 @@ class Stepper:
             return ang
 
     def _write_shifter_nybble(self):
-        # Compose the full 8-bit byte and write using the shared lock
         with Stepper.shifter_lock:
             Stepper.shifter_outputs &= ~(0b1111 << self.bit_start)
             Stepper.shifter_outputs |= (Stepper.seq[self._step_state] << self.bit_start)
             self.s.shiftByte(Stepper.shifter_outputs)
 
     def _step_micro(self, direction):
-        # direction: +1 or -1 (one microstep index change)
         self._step_state = (self._step_state + direction) % len(Stepper.seq)
-        # write to the shift register
         self._write_shifter_nybble()
-        # update integer step counter
         with self._steps_lock:
             self.steps_taken += direction
 
     def _motor_loop(self):
-        # Continuously move towards target angle using shortest-path logic.
         while not self._stop_event.is_set():
             current = self._current_angle()
             with self._target_lock:
-                target = self.target_angle_deg  # may be any real number (we normalize below)
-            # compute shortest-path delta (in degrees)
-            # normalize target to nearest equivalent angle around current:
+                target = self.target_angle_deg
             desired = target % 360.0
-            delta = (desired - current + 180.0) % 360.0 - 180.0  # in (-180,180]
+            delta = (desired - current + 180.0) % 360.0 - 180.0
             step_threshold = 1.0 / Stepper.steps_per_degree
             if abs(delta) >= step_threshold:
                 direction = 1 if delta > 0 else -1
                 self._step_micro(direction)
-                # microstep delay
                 time.sleep(MOTOR_STEP_DELAY_US / 1e6)
             else:
-                time.sleep(0.008)  # idle small sleep to reduce CPU usage
+                time.sleep(0.008)
 
     def goAngle(self, angle_deg):
-        """
-        Command an absolute angle (in degrees). This method chooses the equivalent angle
-        that yields the shortest rotation from the motor's current angle — so the motor
-        will never Spin > 180 degrees to reach a target.
-        angle_deg can be any real number (negative allowed); internally mapped to nearest
-        equivalent of that angle relative to current motor position.
-        """
         with self._target_lock:
             cur = self._current_angle()
             desired = float(angle_deg) % 360.0
             delta = (desired - cur + 180.0) % 360.0 - 180.0
-            # choose target equal to current + delta (this is the nearest equivalent)
-            target = cur + delta
-            # store the absolute target degree (keeping it within reasonable range)
-            self.target_angle_deg = target
-        # immediate return; motor thread will move towards target
+            self.target_angle_deg = cur + delta
 
     def zero(self):
-        # make current position read as 0 degrees (but keep internal step_state)
         with self._steps_lock:
             self.steps_taken = 0
         with self._target_lock:
@@ -136,25 +105,17 @@ class Stepper:
         self._thread.join(timeout=1.0)
 
 # ============================================================
-# Hardware setup: GPIO, shift register, motors, laser
+# Hardware setup
 # ============================================================
 
 GPIO.setmode(GPIO.BCM)
-
-# create the shifter instance (pins may be different on your setup)
 s = Shifter(data=16, latch=20, clock=21)
 
-# Create steppers with explicit bit_start:
-# Motor 1 (az) uses bits 4..7 -> bit_start = 4
-# Motor 2 (el) uses bits 0..3 -> bit_start = 0
-m1 = Stepper(s, bit_start=4, name="AZ")  # motor 1 -> AZIMUTH
-m2 = Stepper(s, bit_start=0, name="EL")  # motor 2 -> ELEVATION
-
-# Initialize both to zero position (software zero)
+m1 = Stepper(s, bit_start=4, name="AZ")
+m2 = Stepper(s, bit_start=0, name="EL")
 m1.zero()
 m2.zero()
 
-# Laser setup
 GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 def laser_on():
@@ -165,10 +126,22 @@ def laser_off():
 
 laser_off()
 
-# UI state
-slider_vals = [0.0, 0.0]   # motor 1 (az), motor 2 (el)
+slider_vals = [0.0, 0.0]
 status_lock = threading.Lock()
 run_state = {"running": False, "last_error": ""}
+
+# ============================================================
+# JSON print at startup
+# ============================================================
+
+try:
+    data = urllib.request.urlopen(POSITIONS_URL, timeout=5.0)
+    positions = json.loads(data.read().decode('utf-8'))
+    print("\n===== positions.json =====")
+    print(json.dumps(positions, indent=2))
+    print("==========================\n")
+except Exception as e:
+    print("[ERROR] Could not load positions.json at startup:", e)
 
 # ============================================================
 # Geometry helpers
@@ -181,46 +154,27 @@ def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
     return x, y, z
 
 def compute_target_angles(my_r, my_theta, target):
-    """
-    target: dict with keys r (cm), theta (rad), optional z (cm)
-    Returns: (azimuth_deg, elevation_deg)
-      - azimuth_deg: 0..360 absolute (direction from turret to target)
-      - elevation_deg: -90..+90 degrees above horizontal
-    """
     tx = float(target["r"])
     ttheta = float(target["theta"])
     tz = float(target.get("z", 0.0))
-
     my_x, my_y, my_z = polar_to_cartesian(my_r, my_theta, 0.0)
     t_x, t_y, t_z = polar_to_cartesian(tx, ttheta, tz)
-
     dx = t_x - my_x
     dy = t_y - my_y
     dz = t_z - my_z
-
     az_rad = math.atan2(dy, dx)
     az_deg = (math.degrees(az_rad)) % 360.0
-
     horiz = math.hypot(dx, dy)
     el_rad = math.atan2(dz, horiz)
-    el_deg = math.degrees(el_rad)  # -90..+90
-
+    el_deg = math.degrees(el_rad)
     return az_deg, el_deg
 
-# ============================================================
-# JSON fetching
-# ============================================================
-
 def fetch_positions(url, timeout=5.0):
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            data = resp.read().decode('utf-8')
-            return json.loads(data)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch positions.json: {e}")
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.load(resp)
 
 # ============================================================
-# Targeting sequence (threaded runner using m1,m2 objects)
+# Targeting sequence
 # ============================================================
 
 def run_targeting_sequence_thread():
@@ -251,49 +205,26 @@ def run_targeting_sequence_thread():
     my_theta = float(my_entry["theta"])
 
     targets = []
-    # other turrets (z = 0)
     for tid, info in turrets.items():
         if int(tid) == TEAM_ID:
             continue
-        targets.append({
-            "type": "turret",
-            "id": int(tid),
-            "r": float(info["r"]),
-            "theta": float(info["theta"]),
-            "z": 0.0
-        })
+        targets.append({"type": "turret", "id": int(tid), "r": float(info["r"]), "theta": float(info["theta"]), "z": 0.0})
 
-    # globes
     for gi, g in enumerate(data.get("globes", [])):
-        targets.append({
-            "type": "globe",
-            "id": gi,
-            "r": float(g["r"]),
-            "theta": float(g["theta"]),
-            "z": float(g.get("z", 0.0))
-        })
+        targets.append({"type": "globe", "id": gi, "r": float(g["r"]), "theta": float(g["theta"]), "z": float(g.get("z", 0.0))})
 
     print(f"[TARGETING] Found {len(targets)} targets.")
 
     for t in targets:
         az_deg, el_deg = compute_target_angles(my_r, my_theta, t)
         print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
-
-        # Command motors:
-        # m1 -> azimuth (0..360)
         m1.goAngle(az_deg)
-
-        # For elevation, m2.goAngle accepts angles in degrees; we pass el_deg directly
-        # el_deg is in -90..+90. goAngle will pick the closest equivalent (so it'll move minimal)
         m2.goAngle(el_deg)
-
-        # Wait until motors within tolerance, or timeout
         t0 = time.time()
         timeout = 10.0
         while True:
             cur_az = m1._current_angle()
             cur_el_raw = m2._current_angle()
-            # convert raw el into -180..180 for comparison, then into -180..180 centered
             cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
             diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
             diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
@@ -303,8 +234,6 @@ def run_targeting_sequence_thread():
                 print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}")
                 break
             time.sleep(0.02)
-
-        # Fire laser exactly LASER_FIRE_DURATION seconds
         print("[FIRE] Laser ON")
         laser_on()
         t_fire_start = time.time()
@@ -318,7 +247,7 @@ def run_targeting_sequence_thread():
     print("[TARGETING] Sequence complete.")
 
 # ============================================================
-# Simple HTML page with manual controls & sequence start
+# HTML UI
 # ============================================================
 
 def html_page():
@@ -387,8 +316,9 @@ function postAction(action) {{
 </html>"""
 
 # ============================================================
-# Utility: get local IP (for user to access web UI)
+# Utility: get local IP
 # ============================================================
+
 def get_ip_address():
     sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -401,8 +331,9 @@ def get_ip_address():
     return ip
 
 # ============================================================
-# Simple blocking socket web server (keeps everything single-process)
+# Web server
 # ============================================================
+
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('', 8080))
 server.listen(1)
@@ -418,26 +349,21 @@ try:
             conn.close()
             continue
 
-        # handle POST bodies
         if request.startswith("POST"):
             body = request.split("\r\n\r\n", 1)[-1]
             params = parse_qs(body)
 
-            # slider controls
             if "motor" in params and "level" in params:
                 idx = int(params["motor"][0])
                 level = float(params["level"][0])
                 slider_vals[idx] = level
                 if idx == 0:
-                    # azimuth: pass 0..360
                     m1.goAngle(level)
                     print(f"[UI] Manual AZ set to {level:.2f}°")
                 else:
-                    # elevation: pass -90..90 (goAngle handles nearest equivalent)
                     m2.goAngle(level)
                     print(f"[UI] Manual EL set to {level:.2f}°")
 
-            # action buttons
             if "action" in params:
                 action = params["action"][0]
                 if action == "laser_on":
@@ -458,7 +384,6 @@ try:
                             t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
                             t.start()
 
-        # Serve page
         response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
         conn.sendall(response.encode())
         conn.close()
@@ -467,7 +392,6 @@ except KeyboardInterrupt:
     print("\nShutting down...")
     try:
         laser_off()
-        # stop motor threads
         m1.stop()
         m2.stop()
     except Exception:
