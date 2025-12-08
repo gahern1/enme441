@@ -1,7 +1,7 @@
 # ============================================================
-#  FULL WEB + SLIDER + STEPPER + LASER + TARGETING
-#  Implements: manual motor control, laser on/off, zero,
-#              autonomous targeting sequence reading positions.json
+#  FULL WEB + SLIDER + STEPPER + JSON TARGETING (Option B)
+#  Motor mapping: m1 = AZIMUTH, m2 = ELEVATION
+#  TEAM_ID set to 14
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -16,7 +16,7 @@ import math
 import threading
 
 # ==================== CONFIG ====================
-TEAM_ID = 1                 # <-- set your assigned team number here (integer)
+TEAM_ID = 14                # <-- your team number
 POSITIONS_URL = "http://192.168.1.254:8000/positions.json"
 LASER_PIN = 18              # BCM pin used to switch laser (via transistor or resistor)
 LASER_FIRE_DURATION = 3.0   # seconds laser is on for each firing event
@@ -25,7 +25,6 @@ TARGET_TOLERANCE_DEG = 1.0  # consider motor at target when within this many deg
 
 # ============================================================
 #   STEPPER CLASS (Integer-step counting, shortest-path)
-#   (unchanged core logic, with small improvements for safe read)
 # ============================================================
 
 class Stepper:
@@ -44,7 +43,7 @@ class Stepper:
         # Give each motor a unique starting phase
         self.step_state = Stepper.num_steppers % 8
 
-        # Correct bit mapping for your wiring (0–3 for m1, 4–7 for m2)
+        # Map first created Stepper -> bits 0-3, second -> 4-7
         self.shifter_bit_start = 4 * Stepper.num_steppers
 
         Stepper.num_steppers += 1
@@ -56,7 +55,6 @@ class Stepper:
 
     def _current_angle(self):
         with self.steps_taken.get_lock():
-            # Normalize into 0-360
             ang = (self.steps_taken.value / Stepper.steps_per_degree) % 360.0
             if ang < 0:
                 ang += 360.0
@@ -102,7 +100,6 @@ class Stepper:
             self.steps_taken.value = 0
         with self.target_angle.get_lock():
             self.target_angle.value = 0.0
-        # do not reset step_state — preserves unique phase
 
 # ============================================================
 #   SETUP SHIFT REGISTER + MOTORS + LASER GPIO
@@ -114,8 +111,8 @@ GPIO.setmode(GPIO.BCM)
 s = Shifter(data=16, latch=20, clock=21)
 lock = multiprocessing.Lock()
 
-m1 = Stepper(s, lock)  # azimuth motor (assumption)
-m2 = Stepper(s, lock)  # elevation motor (assumption)
+m1 = Stepper(s, lock)  # motor 1 -> AZIMUTH
+m2 = Stepper(s, lock)  # motor 2 -> ELEVATION
 
 m1.zero()
 m2.zero()
@@ -123,20 +120,17 @@ m2.zero()
 # Laser output pin setup
 GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
 
-# Helper laser control functions (software only; use hardware resistor/transistor in practice)
 def laser_on():
     GPIO.output(LASER_PIN, GPIO.HIGH)
 
 def laser_off():
     GPIO.output(LASER_PIN, GPIO.LOW)
 
-# Ensure safe startup
 laser_off()
 
 # Shared UI values (simple local state)
-slider_vals = [0, 0]  # degree values for UI display
+slider_vals = [0.0, 0.0]  # degrees for UI display
 status_lock = threading.Lock()
-run_process = None
 run_state = {"running": False, "last_error": ""}
 
 # ============================================================
@@ -144,7 +138,6 @@ run_state = {"running": False, "last_error": ""}
 # ============================================================
 
 def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
-    """Return (x, y, z) in cm using theta in radians."""
     x = r_cm * math.cos(theta_rad)
     y = r_cm * math.sin(theta_rad)
     z = z_cm
@@ -152,18 +145,14 @@ def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
 
 def compute_target_angles(my_r, my_theta, target):
     """
-    target can be either:
-      - turret: dict with keys 'r' and 'theta' (no z -> treated as z=0)
-      - globe: dict with keys 'r','theta','z'
-    Returns (azimuth_deg, elevation_deg)
-    Azimuth: absolute angle (degrees) wrt global coord (0-360)
-    Elevation: degrees above horizontal
+    target: dict with r (cm), theta (rad), optionally z (cm)
+    returns (azimuth_deg, elevation_deg)
+    azimuth_deg in 0..360, elevation_deg in -90..+90
     """
-    tx = target.get("r")
-    ttheta = target.get("theta")
-    tz = target.get("z", 0.0)
+    tx = float(target["r"])
+    ttheta = float(target["theta"])
+    tz = float(target.get("z", 0.0))
 
-    # convert to cartesian (cm)
     my_x, my_y, my_z = polar_to_cartesian(my_r, my_theta, 0.0)
     t_x, t_y, t_z = polar_to_cartesian(tx, ttheta, tz)
 
@@ -171,16 +160,13 @@ def compute_target_angles(my_r, my_theta, target):
     dy = t_y - my_y
     dz = t_z - my_z
 
-    # Azimuth: absolute direction from turret base to target in degrees
     azimuth_rad = math.atan2(dy, dx)
     azimuth_deg = math.degrees(azimuth_rad) % 360.0
 
-    # Elevation: angle between horizontal plane and target direction
     horizontal_dist = math.hypot(dx, dy)
     elevation_rad = math.atan2(dz, horizontal_dist)
     elevation_deg = math.degrees(elevation_rad)
 
-    # Normalize elevation into 0-360 if you want; here we use -90..+90 typical
     return azimuth_deg, elevation_deg
 
 # ============================================================
@@ -196,28 +182,10 @@ def fetch_positions(url, timeout=5.0):
         raise RuntimeError(f"Failed to fetch positions.json: {e}")
 
 # ============================================================
-#   TARGETING SEQUENCE (runs in separate process)
+#   TARGETING SEQUENCE (threaded runner)
 # ============================================================
 
-def targeting_sequence_proc(team_id, positions_url, m_az, m_el):
-    """
-    This function runs in a separate process.
-    m_az and m_el are Stepper proxies in the parent process if using multiprocessing.
-    But because Stepper instances are not trivially sharable across processes, we will
-    run the targeting sequence in a separate THREAD in the main process by default.
-    (This function kept for completeness if later adapted to IPC.)
-    """
-    # Not used directly in this script; the threading-based runner below is used.
-
 def run_targeting_sequence_thread():
-    """
-    Run in a background thread (keeps access to Stepper objects).
-    Steps:
-      - fetch JSON
-      - find our turret entry
-      - build list of targets: other turrets (exclude self) and globes
-      - for each target: compute angles, rotate motors, wait until in tolerance, fire laser 3s
-    """
     with status_lock:
         run_state["running"] = True
         run_state["last_error"] = ""
@@ -231,10 +199,9 @@ def run_targeting_sequence_thread():
         print("Error fetching positions:", e)
         return
 
-    # Find our turret entry
     turrets = data.get("turrets", {})
     if str(TEAM_ID) not in turrets:
-        err = f"Team {TEAM_ID} not found in JSON."
+        err = f"Team {TEAM_ID} not found in positions.json"
         with status_lock:
             run_state["running"] = False
             run_state["last_error"] = err
@@ -245,10 +212,8 @@ def run_targeting_sequence_thread():
     my_r = float(my_entry["r"])
     my_theta = float(my_entry["theta"])
 
-    # Build target list: all turrets except self, and all globes
+    # Build target list: other turrets (exclude self) and globes
     targets = []
-
-    # add turrets (z = 0)
     for tid, info in turrets.items():
         if int(tid) == TEAM_ID:
             continue
@@ -260,7 +225,6 @@ def run_targeting_sequence_thread():
             "z": 0.0
         })
 
-    # add globes
     globes = data.get("globes", [])
     for gi, g in enumerate(globes):
         targets.append({
@@ -271,48 +235,53 @@ def run_targeting_sequence_thread():
             "z": float(g["z"])
         })
 
-    print(f"Found {len(targets)} targets to engage.")
+    print(f"[TARGETING] {len(targets)} targets found.")
 
-    # For each target: compute azimuth & elevation, move motors, fire laser 3s
     for t in targets:
         az_deg, el_deg = compute_target_angles(my_r, my_theta, t)
-        print(f"Target -> {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
+        print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
 
-        # Command motors
-        # Assume m1 -> azimuth, m2 -> elevation (adjust if opposite)
+        # Command motors (m1 -> azimuth, m2 -> elevation)
         m1.goAngle(az_deg)
-        m2.goAngle(el_deg)
+        # convert elevation (-90..90) to a 0..360 motor angle if needed:
+        # We will map elevation into 0..360 such that motor's zero=0deg horizontal,
+        # positive elevation is a positive motor rotation from that zero.
+        # If your elevation motor expects a different range, adapt here.
+        m2_target = (el_deg + 360.0) % 360.0
+        m2.goAngle(m2_target)
 
-        # Wait until both motors reach targets within tolerance (with timeout)
+        # Wait until target reached or timeout
         start_wait = time.time()
-        timeout = 10.0  # seconds to wait for motors to move to target
+        timeout = 10.0
         while True:
             cur_az = m1._current_angle()
-            cur_el = m2._current_angle()
+            cur_el_raw = m2._current_angle()
+            # convert raw el motor angle back to -180..180 centered
+            cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
             diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
             diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
             if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
                 break
             if time.time() - start_wait > timeout:
-                print(f"Warning: motor timeout reaching target az={az_deg:.2f},el={el_deg:.2f}")
+                print(f"[WARN] Motor timeout reaching target az={az_deg:.2f}, el={el_deg:.2f}")
                 break
             time.sleep(0.02)
 
-        # Fire laser for exactly LASER_FIRE_DURATION seconds
-        print("Firing laser...")
+        # Fire laser exactly LASER_FIRE_DURATION seconds
+        print("[FIRE] Laser ON")
         laser_on()
         t0 = time.time()
         while time.time() - t0 < LASER_FIRE_DURATION:
             time.sleep(0.01)
         laser_off()
-        print("Laser cycle complete.")
+        print("[FIRE] Laser OFF")
 
     with status_lock:
         run_state["running"] = False
-    print("Targeting sequence complete.")
+    print("[TARGETING] Sequence complete.")
 
 # ============================================================
-#   HTML PAGE (updated with buttons and status)
+#   HTML PAGE (buttons + sliders)
 # ============================================================
 
 def html_page():
@@ -321,19 +290,15 @@ def html_page():
         last_err = run_state["last_error"]
     return f"""<!DOCTYPE html>
 <html>
-<head>
-  <meta charset="UTF-8">
-  <title>Turret Controller</title>
-  <style>
-    body {{ font-family: Arial; text-align: center; margin-top: 20px; }}
-    .slider-container {{ margin: 15px auto; width: 360px; }}
-    input[type=range] {{ width: 100%; }}
-    button {{ padding: 8px 14px; margin: 6px; }}
-    .status {{ margin-top: 12px; color: #333; }}
-  </style>
-</head>
+<head><meta charset="UTF-8"><title>Turret Controller - Team {TEAM_ID}</title>
+<style>
+  body {{ font-family: Arial; text-align: center; margin-top: 20px; }}
+  .slider-container {{ margin: 15px auto; width: 360px; }}
+  input[type=range] {{ width: 100%; }}
+  button {{ padding: 8px 14px; margin: 6px; }}
+  .status {{ margin-top: 12px; color: #333; }}
+</style></head>
 <body>
-
 <h2>IoT Laser Turret — Team {TEAM_ID}</h2>
 
 <div>
@@ -380,8 +345,7 @@ function postAction(action) {{
 }}
 </script>
 
-</body>
-</html>"""
+</body></html>"""
 
 # ============================================================
 #   GET IP ADDRESS
@@ -399,7 +363,7 @@ def get_ip_address():
     return ip
 
 # ============================================================
-#   WEB SERVER LOOP (single-threaded accept loop with background actions)
+#   WEB SERVER LOOP
 # ============================================================
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -420,45 +384,40 @@ try:
             body = request.split("\r\n\r\n", 1)[-1]
             params = parse_qs(body)
 
-            # Manual motor control via sliders
             if "motor" in params and "level" in params:
                 idx = int(params["motor"][0])
-                # convert slider input to degrees (slider already uses degrees in UI)
                 level = float(params["level"][0])
                 slider_vals[idx] = level
 
-                # For elevation slider, which ranges -90..90, ensure mapping correct
-                target_angle = level % 360.0
-                motor = m1 if idx == 0 else m2
-                motor.goAngle(target_angle)
-                print(f"Manual: Motor {idx+1} → {target_angle:.2f}°")
+                if idx == 0:
+                    # azimuth slider uses 0..360 directly
+                    motor_target = level % 360.0
+                    m1.goAngle(motor_target)
+                else:
+                    # elevation slider gives -90..90; map to motor angle space
+                    # here we map elevation e (-90..90) -> motor angle (e mod 360)
+                    # adjust mapping if your elevation motor zero differs physically
+                    motor_target = (level + 360.0) % 360.0
+                    m2.goAngle(motor_target)
+                print(f"Manual: Motor {idx+1} → {level:.2f}")
 
-            # Action buttons
             if "action" in params:
                 action = params["action"][0]
                 if action == "laser_on":
-                    laser_on()
-                    print("Laser turned ON (manual).")
+                    laser_on(); print("Laser ON (manual)")
                 elif action == "laser_off":
-                    laser_off()
-                    print("Laser turned OFF (manual).")
+                    laser_off(); print("Laser OFF (manual)")
                 elif action == "zero":
-                    m1.zero()
-                    m2.zero()
-                    print("Motors zeroed (software).")
+                    m1.zero(); m2.zero(); print("Motors zeroed")
                 elif action == "start_sequence":
-                    # Start the background targeting thread if not already running
                     with status_lock:
                         if run_state["running"]:
-                            print("Sequence already running — ignoring start request.")
+                            print("Sequence already running")
                         else:
-                            print("Starting targeting sequence...")
-                            # start thread
+                            print("Starting targeting sequence")
                             t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
                             t.start()
-                    # end start_sequence
 
-        # Respond with HTML page (always)
         response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
         conn.sendall(response.encode())
         conn.close()
