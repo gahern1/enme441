@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+# ============================================================
+# IoT Laser Turret — Fully Standalone (No JSON / No Network)
+# - Motor 1 (EL) -> shift register bits 4-7
+# - Motor 2 (AZ) -> shift register bits 0-3
+# - Threaded motor loops
+# - goAngle uses shortest-path immediately
+# ============================================================
+
+import RPi.GPIO as GPIO
+import socket
+import time
+import math
+import threading
+import sys
+from shifter import Shifter
+from urllib.parse import parse_qs
+
+# ==================== CONFIG ====================
+TEAM_ID = 14
+LASER_PIN = 18
+LASER_FIRE_DURATION = 3.0
+TARGET_TOLERANCE_DEG = 1.0
+MOTOR_STEP_DELAY_US = 1200
+# =================================================
+
+# ============================================================
+# Stepper class
+# ============================================================
+
+class Stepper:
+    seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
+    steps_per_degree = 4096.0 / 360.0
+    shifter_outputs = 0
+    shifter_lock = threading.Lock()
+
+    def __init__(self, shifter, bit_start, name=""):
+        self.s = shifter
+        self.bit_start = int(bit_start)
+        self.name = name or f"motor@{bit_start}"
+        self._steps_lock = threading.Lock()
+        self.steps_taken = 0
+        self._target_lock = threading.Lock()
+        self.target_angle_deg = 0.0
+        self._step_state = 0
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._motor_loop, daemon=True)
+        self._thread.start()
+
+    def _current_angle(self):
+        with self._steps_lock:
+            ang = (self.steps_taken / Stepper.steps_per_degree) % 360.0
+            if ang < 0:
+                ang += 360.0
+            return ang
+
+    def _write_shifter_nybble(self):
+        with Stepper.shifter_lock:
+            Stepper.shifter_outputs &= ~(0b1111 << self.bit_start)
+            Stepper.shifter_outputs |= (Stepper.seq[self._step_state] << self.bit_start)
+            self.s.shiftByte(Stepper.shifter_outputs)
+
+    def _step_micro(self, direction):
+        self._step_state = (self._step_state + direction) % len(Stepper.seq)
+        self._write_shifter_nybble()
+        with self._steps_lock:
+            self.steps_taken += direction
+
+    def _motor_loop(self):
+        while not self._stop_event.is_set():
+            current = self._current_angle()
+            with self._target_lock:
+                target = self.target_angle_deg
+            desired = target % 360.0
+            delta = (desired - current + 180.0) % 360.0 - 180.0
+            step_threshold = 1.0 / Stepper.steps_per_degree
+            if abs(delta) >= step_threshold:
+                direction = 1 if delta > 0 else -1
+                self._step_micro(direction)
+                time.sleep(MOTOR_STEP_DELAY_US / 1e6)
+            else:
+                time.sleep(0.008)
+
+    def goAngle(self, angle_deg):
+        with self._target_lock:
+            cur = self._current_angle()
+            desired = float(angle_deg) % 360.0
+            delta = (desired - cur + 180.0) % 360.0 - 180.0
+            self.target_angle_deg = cur + delta
+
+    def zero(self):
+        with self._steps_lock:
+            self.steps_taken = 0
+        with self._target_lock:
+            self.target_angle_deg = 0.0
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+
+# ============================================================
+# Hardware setup
+# ============================================================
+
+GPIO.setmode(GPIO.BCM)
+s = Shifter(data=16, latch=20, clock=21)
+
+m1 = Stepper(s, bit_start=4, name="EL")   # Elevation
+m2 = Stepper(s, bit_start=0, name="AZ")   # Azimuth
+m1.zero()
+m2.zero()
+
+GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
+
+def laser_on():
+    GPIO.output(LASER_PIN, GPIO.HIGH)
+
+def laser_off():
+    GPIO.output(LASER_PIN, GPIO.LOW)
+
+laser_off()
+
+slider_vals = [0.0, 0.0]
+status_lock = threading.Lock()
+run_state = {"running": False, "last_error": ""}
+
+# ============================================================
+# Hardcoded positions (replace JSON)
+# ============================================================
+
+TURRETS = {
+    1: {"r": 154.305, "theta": 2.775073510670984},
+    2: {"r": 154.305, "theta": 2.251474735072685},
+    3: {"r": 154.305, "theta": 1.9722220547535922},
+    4: {"r": 154.305, "theta": 1.3439035240356338},
+    5: {"r": 154.305, "theta": 4.520402762665313},
+    6: {"r": 154.305, "theta": 5.759586531581287},
+    7: {"r": 154.305, "theta": 4.97418836818384},
+    8: {"r": 154.305, "theta": 3.2463124087094526},
+    9: {"r": 154.305, "theta": 3.6651914291880923},
+    10: {"r": 154.305, "theta": 5.288347633542818},
+    11: {"r": 154.305, "theta": 4.1887902047863905},
+    12: {"r": 154.305, "theta": 0.6806784082777885},
+    13: {"r": 154.305, "theta": 0.3141592653589793},
+    14: {"r": 154.305, "theta": 1.0995574287564276},
+    15: {"r": 154.305, "theta": 2.443460952792061},
+    16: {"r": 154.305, "theta": 1.5533430342749535},
+    17: {"r": 154.305, "theta": 6.03883921190038},
+    18: {"r": 154.305, "theta": 0.12217304763960307},
+    19: {"r": 154.305, "theta": 0.8552113334772214},
+    20: {"r": 154.305, "theta": 4.747295565424577},
+    21: {"r": 154.305, "theta": 5.567600313861911},
+    22: {"r": 154.305, "theta": 3.0543261909900763}
+}
+
+GLOBES = [
+    {"r": 154.305, "theta": 5.951572749300663, "z": 77.0},
+    {"r": 154.305, "theta": 6.2482787221397, "z": 22.0},
+    {"r": 154.305, "theta": 1.3089969389957472, "z": 93.0},
+    {"r": 154.305, "theta": 2.6179938779914944, "z": 154.0},
+    {"r": 154.305, "theta": 3.6651914291880923, "z": 58.0},
+    {"r": 154.305, "theta": 3.106686068549907, "z": 163.0},
+    {"r": 154.305, "theta": 4.258603374866164, "z": 81.0},
+    {"r": 154.305, "theta": 4.031710572106902, "z": 19.0}
+]
+
+# ============================================================
+# Geometry helpers
+# ============================================================
+
+def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
+    x = r_cm * math.cos(theta_rad)
+    y = r_cm * math.sin(theta_rad)
+    z = z_cm
+    return x, y, z
+
+def compute_target_angles(my_r, my_theta, target):
+    tx = float(target["r"])
+    ttheta = float(target["theta"])
+    tz = float(target.get("z", 0.0))
+    my_x, my_y, my_z = polar_to_cartesian(my_r, my_theta, 0.0)
+    t_x, t_y, t_z = polar_to_cartesian(tx, ttheta, tz)
+    dx = t_x - my_x
+    dy = t_y - my_y
+    dz = t_z - my_z
+    az_rad = math.atan2(dy, dx)
+    az_deg = (math.degrees(az_rad)) % 360.0
+    horiz = math.hypot(dx, dy)
+    el_rad = math.atan2(dz, horiz)
+    el_deg = math.degrees(el_rad)
+    return az_deg, el_deg
+
+# ============================================================
+# Targeting sequence
+# ============================================================
+
+def run_targeting_sequence_thread():
+    with status_lock:
+        run_state["running"] = True
+        run_state["last_error"] = ""
+
+    turrets = TURRETS
+    if TEAM_ID not in turrets:
+        err = f"Team {TEAM_ID} not found in positions"
+        with status_lock:
+            run_state["running"] = False
+            run_state["last_error"] = err
+        print("[ERROR]", err)
+        return
+
+    my_entry = turrets[TEAM_ID]
+    my_r = float(my_entry["r"])
+    my_theta = float(my_entry["theta"])
+
+    targets = []
+    for tid, info in turrets.items():
+        if tid == TEAM_ID:
+            continue
+        targets.append({"type": "turret", "id": tid, "r": float(info["r"]), "theta": float(info["theta"]), "z": 0.0})
+
+    for gi, g in enumerate(GLOBES):
+        targets.append({"type": "globe", "id": gi, "r": float(g["r"]), "theta": float(g["theta"]), "z": float(g.get("z", 0.0))})
+
+    print(f"[TARGETING] Found {len(targets)} targets.")
+
+    for t in targets:
+        az_deg, el_deg = compute_target_angles(my_r, my_theta, t)
+        print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
+        m2.goAngle(az_deg)  # AZ = m2
+        m1.goAngle(el_deg)  # EL = m1
+        t0 = time.time()
+        timeout = 10.0
+        while True:
+            cur_az = m2._current_angle()
+            cur_el_raw = m1._current_angle()
+            cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
+            diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
+            diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
+            if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
+                break
+            if time.time() - t0 > timeout:
+                print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}°")
+                break
+            time.sleep(0.02)
+        print("[FIRE] Laser ON")
+        laser_on()
+        t_fire_start = time.time()
+        while time.time() - t_fire_start < LASER_FIRE_DURATION:
+            time.sleep(0.01)
+        laser_off()
+        print("[FIRE] Laser OFF")
+
+    with status_lock:
+        run_state["running"] = False
+    print("[TARGETING] Sequence complete.")
+
+# ============================================================
+# HTML UI
+# ============================================================
+
+def html_page():
+    with status_lock:
+        running = run_state["running"]
+        last_err = run_state["last_error"]
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Turret Controller — Team {TEAM_ID}</title>
+  <style>
+    body {{ font-family: Arial; text-align:center; margin-top:20px; }}
+    .slider {{ width:360px; margin:12px auto; }}
+    input[type=range] {{ width:100%; }}
+    button {{ padding:8px 14px; margin:6px; }}
+    .status {{ margin-top:12px; }}
+  </style>
+</head>
+<body>
+  <h2>IoT Laser Turret — Team {TEAM_ID}</h2>
+
+  <div>
+    <button onclick="postAction('laser_on')">Laser ON</button>
+    <button onclick="postAction('laser_off')">Laser OFF</button>
+    <button onclick="postAction('zero')">Zero Motors</button>
+    <button onclick="postAction('start_sequence')">Start Targeting Sequence</button>
+  </div>
+
+  <div class="slider">
+    <label>Motor 1 (Elevation): <span id="elval">{slider_vals[0]:.1f}</span>°</label><br>
+    <input id="motor0" type="range" min="0" max="360" value="{slider_vals[0]}" oninput="updateMotor(0)">
+  </div>
+
+  <div class="slider">
+    <label>Motor 2 (Azimuth): <span id="azval">{slider_vals[1]:.1f}</span>°</label><br>
+    <input id="motor1" type="range" min="0" max="360" value="{slider_vals[1]}" oninput="updateMotor(1)">
+  </div>
+
+  <div class="status">
+    <strong>Sequence running:</strong> {running} <br>
+    <strong>Last error:</strong> {last_err}
+  </div>
+
+<script>
+function updateMotor(idx) {{
+  let val = document.getElementById("motor"+idx).value;
+  if (idx==0) document.getElementById("elval").innerText = val;
+  else document.getElementById("azval").innerText = val;
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "motor="+idx+"&level="+val
+  }});
+}}
+
+function postAction(action) {{
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "action="+action
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+# ============================================================
+# Utility: get local IP
+# ============================================================
+
+def get_ip_address():
+    sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sck.connect(("8.8.8.8", 80))
+        ip = sck.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        sck.close()
+    return ip
+
+# ============================================================
+# Web server
+# ============================================================
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('', 8080))
+server.listen(1)
+
+print(f"🚀 Turret UI: http://{get_ip_address()}:8080")
+print("Press Ctrl-C to stop and cleanup")
+
+try:
+    while True:
+        conn, addr = server.accept()
+        request = conn.recv(8192).decode(errors='ignore')
+        if not request:
+            conn.close()
+            continue
+
+        if request.startswith("POST"):
+            body = request.split("\r\n\r\n", 1)[-1]
+            params = parse_qs(body)
+
+            if "motor" in params and "level" in params:
+                idx = int(params["motor"][0])
+                level = float(params["level"][0])
+                slider_vals[idx] = level
+                if idx == 0:
+                    m1.goAngle(level)
+                    print(f"[UI] Manual EL set to {level:.2f}°")
+                else:
+                    m2.goAngle(level)
+                    print(f"[UI] Manual AZ set to {level:.2f}°")
+
+            if "action" in params:
+                action = params["action"][0]
+                if action == "laser_on":
+                    laser_on()
+                    print("[UI] Laser ON (manual)")
+                elif action == "laser_off":
+                    laser_off()
+                    print("[UI] Laser OFF (manual)")
+                elif action == "zero":
+                    m1.zero(); m2.zero()
+                    print("[UI] Motors zeroed (software)")
+                elif action == "start_sequence":
+                    with status_lock:
+                        if run_state["running"]:
+                            print("[UI] Sequence already running")
+                        else:
+                            print("[UI] Starting targeting sequence thread")
+                            t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
+                            t.start()
+
+        response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
+        conn.sendall(response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+    try:
+        laser_off()
+        m1.stop()
+        m2.stop()
+    except Exception:
+        pass
+    GPIO.cleanup()
+    server.close()
+    sys.exit(0)
