@@ -7,6 +7,7 @@
 # - goAngle uses shortest-path immediately
 # - Hardcoded positions (no JSON)
 # - Laser height incorporated
+# - EL initialized horizontal (no flip)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -25,6 +26,7 @@ LASER_FIRE_DURATION = 3.0
 TARGET_TOLERANCE_DEG = 1.0
 MOTOR_STEP_DELAY_US = 1200
 LASER_HEIGHT_CM = 3.25   # Laser height above ground
+EL_INITIAL_ANGLE = 0.0   # Laser horizontal at start
 # =================================================
 
 # ============================================================
@@ -94,11 +96,15 @@ class Stepper:
             delta = (desired - cur + 180.0) % 360.0 - 180.0
             self.target_angle_deg = cur + delta
 
-    def zero(self):
+    def zero(self, init_angle=0.0):
         with self._steps_lock:
-            self.steps_taken = 0
+            # Keep current physical position as zero for EL
+            if self.name == "EL":
+                self.steps_taken = int(init_angle * Stepper.steps_per_degree)
+            else:
+                self.steps_taken = 0
         with self._target_lock:
-            self.target_angle_deg = 0.0
+            self.target_angle_deg = init_angle
 
     def stop(self):
         self._stop_event.set()
@@ -114,7 +120,7 @@ s = Shifter(data=16, latch=20, clock=21)
 # Swap AZ/EL motors
 m1 = Stepper(s, bit_start=4, name="EL")   # Motor 1 = Elevation
 m2 = Stepper(s, bit_start=0, name="AZ")   # Motor 2 = Azimuth
-m1.zero()
+m1.zero(init_angle=EL_INITIAL_ANGLE)
 m2.zero()
 
 GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
@@ -127,7 +133,7 @@ def laser_off():
 
 laser_off()
 
-slider_vals = [0.0, 0.0]
+slider_vals = [EL_INITIAL_ANGLE, 0.0]
 status_lock = threading.Lock()
 run_state = {"running": False, "last_error": ""}
 
@@ -380,7 +386,7 @@ try:
                     laser_off()
                     print("[UI] Laser OFF (manual)")
                 elif action == "zero":
-                    m1.zero(); m2.zero()
+                    m1.zero(init_angle=EL_INITIAL_ANGLE); m2.zero()
                     print("[UI] Motors zeroed (software)")
                 elif action == "start_sequence":
                     with status_lock:
