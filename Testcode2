@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================
-# IoT Laser Turret — AZ/EL Swap Corrected
+# IoT Laser Turret — Full Ready-to-Run
 # - Motor 1 (EL) -> shift register bits 4-7 (inverted)
 # - Motor 2 (AZ) -> shift register bits 0-3
 # - Threaded motor loops
 # - goAngle uses shortest-path immediately
-# - Hardcoded positions (no JSON)
+# - Hardcoded positions
 # - Laser height incorporated
-# - Physical zero for EL to prevent startup flip
+# - Physical zero for EL
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -25,7 +25,7 @@ LASER_PIN = 18
 LASER_FIRE_DURATION = 3.0
 TARGET_TOLERANCE_DEG = 1.0
 MOTOR_STEP_DELAY_US = 1200
-LASER_HEIGHT_CM = 3.25   # Laser height above ground
+LASER_HEIGHT_CM = 3.25   # Laser height off ground
 EL_INITIAL_ANGLE = 0.0   # Horizontal at startup
 # =================================================
 
@@ -49,7 +49,6 @@ class Stepper:
         self.target_angle_deg = 0.0
         self._step_state = 0
         self._stop_event = threading.Event()
-        # EL motor: track physical zero to avoid flip
         self._physical_zero_angle = EL_INITIAL_ANGLE if self.name == "EL" else 0.0
         self._init_offset = 0.0
         self._thread = threading.Thread(target=self._motor_loop, daemon=True)
@@ -71,7 +70,6 @@ class Stepper:
             self.s.shiftByte(Stepper.shifter_outputs)
 
     def _step_micro(self, direction):
-        # Invert EL motion for intuitive up
         if self.name == "EL":
             direction = -direction
         self._step_state = (self._step_state + direction) % len(Stepper.seq)
@@ -217,7 +215,6 @@ def run_targeting_sequence_thread():
     my_theta = float(my_entry["theta"])
     my_z = LASER_HEIGHT_CM
 
-    # Collect targets
     targets = []
     for tid, info in TURRETS.items():
         if tid == TEAM_ID:
@@ -231,8 +228,8 @@ def run_targeting_sequence_thread():
     for t in targets:
         az_deg, el_deg = compute_target_angles(my_r, my_theta, my_z, t)
         print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
-        m2.goAngle(az_deg)  # AZ = m2
-        m1.goAngle(el_deg)  # EL = m1
+        m2.goAngle(az_deg)
+        m1.goAngle(el_deg)
         t0 = time.time()
         timeout = 10.0
         while True:
@@ -260,7 +257,156 @@ def run_targeting_sequence_thread():
     print("[TARGETING] Sequence complete.")
 
 # ============================================================
-# UI and server code remains unchanged
+# HTML UI
 # ============================================================
 
-# (Copy the HTML UI and server code from previous version; no changes)
+def html_page():
+    with status_lock:
+        running = run_state["running"]
+        last_err = run_state["last_error"]
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Turret Controller — Team {TEAM_ID}</title>
+  <style>
+    body {{ font-family: Arial; text-align:center; margin-top:20px; }}
+    .slider {{ width:360px; margin:12px auto; }}
+    input[type=range] {{ width:100%; }}
+    button {{ padding:8px 14px; margin:6px; }}
+    .status {{ margin-top:12px; }}
+  </style>
+</head>
+<body>
+  <h2>IoT Laser Turret — Team {TEAM_ID}</h2>
+
+  <div>
+    <button onclick="postAction('laser_on')">Laser ON</button>
+    <button onclick="postAction('laser_off')">Laser OFF</button>
+    <button onclick="postAction('zero')">Zero Motors</button>
+    <button onclick="postAction('start_sequence')">Start Targeting Sequence</button>
+  </div>
+
+  <div class="slider">
+    <label>Motor 1 (Elevation): <span id="elval">{slider_vals[0]:.1f}</span>°</label><br>
+    <input id="motor0" type="range" min="0" max="360" value="{slider_vals[0]}" oninput="updateMotor(0)">
+  </div>
+
+  <div class="slider">
+    <label>Motor 2 (Azimuth): <span id="azval">{slider_vals[1]:.1f}</span>°</label><br>
+    <input id="motor1" type="range" min="0" max="360" value="{slider_vals[1]}" oninput="updateMotor(1)">
+  </div>
+
+  <div class="status">
+    <strong>Sequence running:</strong> {running} <br>
+    <strong>Last error:</strong> {last_err}
+  </div>
+
+<script>
+function updateMotor(idx) {{
+  let val = document.getElementById("motor"+idx).value;
+  if (idx==0) document.getElementById("elval").innerText = val;
+  else document.getElementById("azval").innerText = val;
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "motor="+idx+"&level="+val
+  }});
+}}
+
+function postAction(action) {{
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "action="+action
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+# ============================================================
+# Utility: get local IP
+# ============================================================
+
+def get_ip_address():
+    sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sck.connect(("8.8.8.8", 80))
+        ip = sck.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        sck.close()
+    return ip
+
+# ============================================================
+# Web server
+# ============================================================
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('', 8080))
+server.listen(1)
+
+print(f"🚀 Turret UI: http://{get_ip_address()}:8080")
+print("Press Ctrl-C to stop and cleanup")
+
+try:
+    while True:
+        conn, addr = server.accept()
+        request = conn.recv(8192).decode(errors='ignore')
+        if not request:
+            conn.close()
+            continue
+
+        if request.startswith("POST"):
+            body = request.split("\r\n\r\n", 1)[-1]
+            params = parse_qs(body)
+
+            if "motor" in params and "level" in params:
+                idx = int(params["motor"][0])
+                level = float(params["level"][0])
+                slider_vals[idx] = level
+                if idx == 0:
+                    m1.goAngle(level)
+                    print(f"[UI] Manual EL set to {level:.2f}°")
+                else:
+                    m2.goAngle(level)
+                    print(f"[UI] Manual AZ set to {level:.2f}°")
+
+            if "action" in params:
+                action = params["action"][0]
+                if action == "laser_on":
+                    laser_on()
+                    print("[UI] Laser ON (manual)")
+                elif action == "laser_off":
+                    laser_off()
+                    print("[UI] Laser OFF (manual)")
+                elif action == "zero":
+                    m1.zero(init_angle=EL_INITIAL_ANGLE)
+                    m2.zero()
+                    print("[UI] Motors zeroed (software)")
+                elif action == "start_sequence":
+                    with status_lock:
+                        if run_state["running"]:
+                            print("[UI] Sequence already running")
+                        else:
+                            print("[UI] Starting targeting sequence thread")
+                            t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
+                            t.start()
+
+        response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
+        conn.sendall(response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+    try:
+        laser_off()
+        m1.stop()
+        m2.stop()
+    except Exception:
+        pass
+    GPIO.cleanup()
+    server.close()
+    sys.exit(0)
