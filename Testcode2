@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# IoT Laser Turret — Full Ready-to-Run (EL flip fixed)
+# IoT Laser Turret — Full Ready-to-Run (EL flip fixed, AZ restored)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -49,10 +49,12 @@ class Stepper:
 
     def _current_angle(self):
         with self._steps_lock:
-            ang = (self.steps_taken / Stepper.steps_per_degree)
             if self.name == "EL":
-                ang = self._physical_zero_angle + ang + self._init_offset
-            return ang
+                # EL uses physical zero + offset
+                return self._physical_zero_angle + self.steps_taken / Stepper.steps_per_degree + self._init_offset
+            else:
+                # AZ just raw steps / deg
+                return self.steps_taken / Stepper.steps_per_degree
 
     def _write_shifter_nybble(self):
         with Stepper.shifter_lock:
@@ -62,7 +64,7 @@ class Stepper:
 
     def _step_micro(self, direction):
         if self.name == "EL":
-            direction = -direction
+            direction = -direction  # Flip EL direction physically
         self._step_state = (self._step_state + direction) % len(Stepper.seq)
         self._write_shifter_nybble()
         with self._steps_lock:
@@ -76,7 +78,11 @@ class Stepper:
             # Clamp EL to -90/+90
             if self.name == "EL":
                 target = max(-90.0, min(90.0, target))
-            delta = target - current
+            # Compute delta
+            if self.name == "AZ":
+                delta = (target - current + 180.0) % 360.0 - 180.0
+            else:
+                delta = target - current
             step_threshold = 1.0 / Stepper.steps_per_degree
             if abs(delta) >= step_threshold:
                 direction = 1 if delta > 0 else -1
@@ -89,7 +95,6 @@ class Stepper:
         with self._target_lock:
             if self.name == "EL":
                 angle_deg = max(-90.0, min(90.0, angle_deg))
-            cur = self._current_angle()
             self.target_angle_deg = angle_deg
 
     def zero(self, init_angle=0.0):
