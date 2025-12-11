@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================
-# IoT Laser Turret — Full Ready-to-Run
-# - Motor 1 (EL) -> shift register bits 4-7 (inverted)
-# - Motor 2 (AZ) -> shift register bits 0-3
-# - Threaded motor loops
-# - goAngle uses shortest-path immediately
-# - Hardcoded positions
-# - Laser height incorporated
-# - Physical zero for EL
+# IoT Laser Turret — Full Ready-to-Run (EL flip fixed)
 # ============================================================
 
 import RPi.GPIO as GPIO
@@ -56,11 +49,9 @@ class Stepper:
 
     def _current_angle(self):
         with self._steps_lock:
-            ang = (self.steps_taken / Stepper.steps_per_degree) % 360.0
+            ang = (self.steps_taken / Stepper.steps_per_degree)
             if self.name == "EL":
-                ang = (self._physical_zero_angle + ang + self._init_offset) % 360.0
-            if ang < 0:
-                ang += 360.0
+                ang = self._physical_zero_angle + ang + self._init_offset
             return ang
 
     def _write_shifter_nybble(self):
@@ -82,8 +73,10 @@ class Stepper:
             current = self._current_angle()
             with self._target_lock:
                 target = self.target_angle_deg
-            desired = target % 360.0
-            delta = (desired - current + 180.0) % 360.0 - 180.0
+            # Clamp EL to -90/+90
+            if self.name == "EL":
+                target = max(-90.0, min(90.0, target))
+            delta = target - current
             step_threshold = 1.0 / Stepper.steps_per_degree
             if abs(delta) >= step_threshold:
                 direction = 1 if delta > 0 else -1
@@ -94,10 +87,10 @@ class Stepper:
 
     def goAngle(self, angle_deg):
         with self._target_lock:
+            if self.name == "EL":
+                angle_deg = max(-90.0, min(90.0, angle_deg))
             cur = self._current_angle()
-            desired = float(angle_deg) % 360.0
-            delta = (desired - cur + 180.0) % 360.0 - 180.0
-            self.target_angle_deg = cur + delta
+            self.target_angle_deg = angle_deg
 
     def zero(self, init_angle=0.0):
         with self._steps_lock:
@@ -234,10 +227,9 @@ def run_targeting_sequence_thread():
         timeout = 10.0
         while True:
             cur_az = m2._current_angle()
-            cur_el_raw = m1._current_angle()
-            cur_el = ((cur_el_raw + 180.0) % 360.0) - 180.0
+            cur_el = m1._current_angle()
             diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
-            diff_el = (el_deg - cur_el + 180.0) % 360.0 - 180.0
+            diff_el = el_deg - cur_el
             if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
                 break
             if time.time() - t0 > timeout:
@@ -257,7 +249,7 @@ def run_targeting_sequence_thread():
     print("[TARGETING] Sequence complete.")
 
 # ============================================================
-# HTML UI
+# HTML UI (unchanged)
 # ============================================================
 
 def html_page():
@@ -289,7 +281,7 @@ def html_page():
 
   <div class="slider">
     <label>Motor 1 (Elevation): <span id="elval">{slider_vals[0]:.1f}</span>°</label><br>
-    <input id="motor0" type="range" min="0" max="360" value="{slider_vals[0]}" oninput="updateMotor(0)">
+    <input id="motor0" type="range" min="-90" max="90" value="{slider_vals[0]}" oninput="updateMotor(0)">
   </div>
 
   <div class="slider">
@@ -326,7 +318,7 @@ function postAction(action) {{
 </html>"""
 
 # ============================================================
-# Utility: get local IP
+# Web server (unchanged)
 # ============================================================
 
 def get_ip_address():
@@ -339,10 +331,6 @@ def get_ip_address():
     finally:
         sck.close()
     return ip
-
-# ============================================================
-# Web server
-# ============================================================
 
 server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server.bind(('', 8080))
