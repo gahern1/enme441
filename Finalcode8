@@ -1,0 +1,344 @@
+import RPi.GPIO as GPIO
+import socket
+from urllib.parse import parse_qs
+import time
+from shifter import Shifter
+import math
+import threading
+import sys
+import json
+import urllib.request
+
+TEAM_ID = 14
+POSITIONS_URL = "http://192.168.1.254:8000/positions.json"
+LASER_PIN = 18
+LASER_FIRE_DURATION = 3.0
+TARGET_TOLERANCE_DEG = 1.0
+MOTOR_STEP_DELAY_US = 1200
+LASER_HEIGHT_CM = 8.255  # updated height
+EL_INITIAL_ANGLE = 0.0
+
+class Stepper:
+    seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
+    steps_per_degree = 4096.0 / 360.0
+    shifter_outputs = 0
+    shifter_lock = threading.Lock()
+
+    def __init__(self, shifter, bit_start, name=""):
+        self.s = shifter
+        self.bit_start = int(bit_start)
+        self.name = name or f"motor@{bit_start}"
+        self._steps_lock = threading.Lock()
+        self.steps_taken = 0
+        self._target_lock = threading.Lock()
+        self.target_angle_deg = 0.0
+        self._step_state = 0
+        self._stop_event = threading.Event()
+        self._physical_zero_angle = EL_INITIAL_ANGLE if self.name == "EL" else 0.0
+        self._init_offset = 0.0
+        self._thread = threading.Thread(target=self._motor_loop, daemon=True)
+        self._thread.start()
+
+    def _current_angle(self):
+        with self._steps_lock:
+            if self.name == "EL":
+                ang = self._physical_zero_angle + self.steps_taken / Stepper.steps_per_degree + self._init_offset
+                return max(-90.0, min(90.0, ang))
+            else:
+                return self.steps_taken / Stepper.steps_per_degree
+
+    def _write_shifter_nybble(self):
+        with Stepper.shifter_lock:
+            Stepper.shifter_outputs &= ~(0b1111 << self.bit_start)
+            Stepper.shifter_outputs |= (Stepper.seq[self._step_state] << self.bit_start)
+            self.s.shiftByte(Stepper.shifter_outputs)
+
+    def _step_micro(self, direction):
+        step_dir = -direction if self.name == "EL" else direction
+        self._step_state = (self._step_state + step_dir) % len(Stepper.seq)
+        self._write_shifter_nybble()
+        with self._steps_lock:
+            self.steps_taken += direction
+
+    def _motor_loop(self):
+        while not self._stop_event.is_set():
+            current = self._current_angle()
+            with self._target_lock:
+                target = self.target_angle_deg
+            if self.name == "EL":
+                target = max(-90.0, min(90.0, target))
+                delta = target - current
+            else:
+                delta = (target - current + 180.0) % 360.0 - 180.0
+            step_threshold = 1.0 / Stepper.steps_per_degree
+            if abs(delta) >= step_threshold:
+                direction = 1 if delta > 0 else -1
+                self._step_micro(direction)
+                time.sleep(MOTOR_STEP_DELAY_US / 1e6)
+            else:
+                time.sleep(0.008)
+
+    def goAngle(self, angle_deg):
+        with self._target_lock:
+            if self.name == "EL":
+                angle_deg = max(-90.0, min(90.0, angle_deg))
+            self.target_angle_deg = angle_deg
+
+    def zero(self, init_angle=0.0):
+        with self._steps_lock:
+            if self.name == "EL":
+                self._physical_zero_angle = init_angle
+                self._init_offset = 0.0
+                self.steps_taken = 0
+            else:
+                self.steps_taken = 0
+        with self._target_lock:
+            self.target_angle_deg = init_angle
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+
+
+GPIO.setmode(GPIO.BCM)
+s = Shifter(data=16, latch=20, clock=21)
+
+m1 = Stepper(s, bit_start=4, name="EL")
+m2 = Stepper(s, bit_start=0, name="AZ")
+m1.zero(init_angle=EL_INITIAL_ANGLE)
+m2.zero()
+
+GPIO.setup(LASER_PIN, GPIO.OUT, initial=GPIO.LOW)
+def laser_on(): GPIO.output(LASER_PIN, GPIO.HIGH)
+def laser_off(): GPIO.output(LASER_PIN, GPIO.LOW)
+laser_off()
+
+slider_vals = [EL_INITIAL_ANGLE, 0.0]
+status_lock = threading.Lock()
+run_state = {"running": False, "last_error": ""}
+
+
+def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
+    x = r_cm * math.cos(theta_rad)
+    y = r_cm * math.sin(theta_rad)
+    z = z_cm
+    return x, y, z
+
+def compute_target_angles(my_r, my_theta, my_z, target):
+    tx = float(target["r"])
+    ttheta = float(target["theta"])
+    tz = float(target.get("z", 0.0))
+    my_x, my_y, my_z = polar_to_cartesian(my_r, my_theta, my_z)
+    t_x, t_y, t_z = polar_to_cartesian(tx, ttheta, tz)
+    dx = t_x - my_x
+    dy = t_y - my_y
+    dz = t_z - my_z
+    az_rad = math.atan2(dy, dx)
+    az_deg = (math.degrees(az_rad)) % 360.0
+    horiz = math.hypot(dx, dy)
+    el_rad = math.atan2(dz, horiz)
+    el_deg = math.degrees(el_rad)
+    return az_deg, el_deg
+
+def fetch_positions(url, timeout=5.0):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def run_targeting_sequence_thread():
+    try:
+        data = fetch_positions(POSITIONS_URL)
+        print("\n[POSITIONS.JSON]")
+        print(json.dumps(data, indent=2))
+    except Exception as e:
+        with status_lock:
+            run_state["running"] = False
+            run_state["last_error"] = f"Fetch error: {e}"
+        print("[ERROR] fetching positions:", e)
+        return
+
+    turrets = data.get("turrets", {})
+    if str(TEAM_ID) not in turrets:
+        err = f"Team {TEAM_ID} not found in positions.json"
+        with status_lock:
+            run_state["running"] = False
+            run_state["last_error"] = err
+        print("[ERROR]", err)
+        return
+
+    my_entry = turrets[str(TEAM_ID)]
+    my_r = float(my_entry["r"])
+    my_theta = float(my_entry["theta"])
+    my_z = LASER_HEIGHT_CM
+
+    targets = []
+    for tid, info in turrets.items():
+        if int(tid) == TEAM_ID: continue
+        targets.append({"type":"turret","id":tid,"r":float(info["r"]),"theta":float(info["theta"]),"z":0.0})
+    for gi, g in enumerate(data.get("globes", [])):
+        targets.append({"type":"globe","id":gi,"r":float(g["r"]),"theta":float(g["theta"]),"z":float(g.get("z",0.0))})
+
+    with status_lock:
+        run_state["running"] = True
+        run_state["last_error"] = ""
+
+    print(f"[TARGETING] Found {len(targets)} targets.")
+    for t in targets:
+        az_deg, el_deg = compute_target_angles(my_r, my_theta, my_z, t)
+        print(f"[TARGET] {t['type']} {t['id']}: az={az_deg:.2f}°, el={el_deg:.2f}°")
+        m2.goAngle(az_deg)
+        m1.goAngle(el_deg)
+        t0 = time.time()
+        timeout = 10.0
+        while True:
+            cur_az = m2._current_angle()
+            cur_el = m1._current_angle()
+            diff_az = (az_deg - cur_az + 180.0) % 360.0 - 180.0
+            diff_el = el_deg - cur_el
+            if abs(diff_az) <= TARGET_TOLERANCE_DEG and abs(diff_el) <= TARGET_TOLERANCE_DEG:
+                break
+            if time.time() - t0 > timeout:
+                print(f"[WARN] Timeout moving to target az={az_deg:.2f}, el={el_deg:.2f}°")
+                break
+            time.sleep(0.02)
+        print("[FIRE] Laser ON")
+        laser_on()
+        t_fire_start = time.time()
+        while time.time() - t_fire_start < LASER_FIRE_DURATION:
+            time.sleep(0.01)
+        laser_off()
+        print("[FIRE] Laser OFF")
+
+    with status_lock:
+        run_state["running"] = False
+    print("[TARGETING] Sequence complete.")
+
+
+def html_page():
+    with status_lock:
+        running = run_state["running"]
+        last_err = run_state["last_error"]
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Turret Controller — Team {TEAM_ID}</title>
+  <style>
+    body {{ font-family: Arial; text-align:center; margin-top:20px; }}
+    .slider {{ width:360px; margin:12px auto; }}
+    input[type=range] {{ width:100%; }}
+    button {{ padding:8px 14px; margin:6px; }}
+    .status {{ margin-top:12px; }}
+  </style>
+</head>
+<body>
+  <h2>IoT Laser Turret — Team {TEAM_ID}</h2>
+
+  <div>
+    <button onclick="postAction('laser_on')">Laser ON</button>
+    <button onclick="postAction('laser_off')">Laser OFF</button>
+    <button onclick="postAction('zero')">Zero Motors</button>
+    <button onclick="postAction('start_sequence')">Start Targeting Sequence</button>
+  </div>
+
+  <div class="slider">
+    <label>Motor 1 (Elevation): <span id="elval">{slider_vals[0]:.1f}</span>°</label><br>
+    <input id="motor0" type="range" min="-90" max="90" value="{slider_vals[0]}" oninput="updateMotor(0)">
+  </div>
+
+  <div class="slider">
+    <label>Motor 2 (Azimuth): <span id="azval">{slider_vals[1]:.1f}</span>°</label><br>
+    <input id="motor1" type="range" min="0" max="360" value="{slider_vals[1]}" oninput="updateMotor(1)">
+  </div>
+
+  <div class="status">
+    <strong>Sequence running:</strong> {running} <br>
+    <strong>Last error:</strong> {last_err}
+  </div>
+
+<script>
+function updateMotor(idx) {{
+  let val = document.getElementById("motor"+idx).value;
+  if (idx==0) document.getElementById("elval").innerText = val;
+  else document.getElementById("azval").innerText = val;
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "motor="+idx+"&level="+val
+  }});
+}}
+
+function postAction(action) {{
+  fetch("/", {{
+    method:"POST",
+    headers:{{"Content-Type":"application/x-www-form-urlencoded"}},
+    body: "action="+action
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+def get_ip_address():
+    sck = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sck.connect(("8.8.8.8", 80))
+        ip = sck.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
+    finally:
+        sck.close()
+    return ip
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('', 8080))
+server.listen(1)
+
+print(f"🚀 Turret UI: http://{get_ip_address()}:8080")
+print("Press Ctrl-C to stop and cleanup")
+
+try:
+    while True:
+        conn, addr = server.accept()
+        request = conn.recv(8192).decode(errors='ignore')
+        if not request:
+            conn.close()
+            continue
+
+        if request.startswith("POST"):
+            body = request.split("\r\n\r\n", 1)[-1]
+            params = parse_qs(body)
+
+            if "motor" in params and "level" in params:
+                idx = int(params["motor"][0])
+                level = float(params["level"][0])
+                slider_vals[idx] = level
+                if idx == 0: m1.goAngle(level)
+                else: m2.goAngle(level)
+
+            if "action" in params:
+                action = params["action"][0]
+                if action == "laser_on": laser_on()
+                elif action == "laser_off": laser_off()
+                elif action == "zero": m1.zero(); m2.zero()
+                elif action == "start_sequence":
+                    with status_lock:
+                        if not run_state["running"]:
+                            t = threading.Thread(target=run_targeting_sequence_thread, daemon=True)
+                            t.start()
+
+        response = "HTTP/1.1 200 OK\nContent-Type: text/html\n\n" + html_page()
+        conn.sendall(response.encode())
+        conn.close()
+
+except KeyboardInterrupt:
+    print("\nShutting down...")
+    try:
+        laser_off()
+        m1.stop()
+        m2.stop()
+    except Exception:
+        pass
+    GPIO.cleanup()
+    server.close()
+    sys.exit(0)
