@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# ============================================================
-# IoT Laser Turret — Team 14
-# - Fetches turret/globe positions from positions.json
-# - EL motor stable, AZ shortest-path
-# - Web UI with sliders and buttons
-# ============================================================
-
 import RPi.GPIO as GPIO
 import socket
 from urllib.parse import parse_qs
@@ -17,7 +9,6 @@ import sys
 import json
 import urllib.request
 
-# ==================== CONFIG ====================
 TEAM_ID = 14
 POSITIONS_URL = "http://192.168.1.254:8000/positions.json"
 LASER_PIN = 18
@@ -26,11 +17,6 @@ TARGET_TOLERANCE_DEG = 1.0
 MOTOR_STEP_DELAY_US = 1200
 LASER_HEIGHT_CM = 8.255  # updated height
 EL_INITIAL_ANGLE = 0.0
-# =================================================
-
-# ============================================================
-# Stepper class (unchanged)
-# ============================================================
 
 class Stepper:
     seq = [0b0001, 0b0011, 0b0010, 0b0110, 0b0100, 0b1100, 0b1000, 0b1001]
@@ -113,9 +99,6 @@ class Stepper:
         self._stop_event.set()
         self._thread.join(timeout=1.0)
 
-# ============================================================
-# Hardware setup
-# ============================================================
 
 GPIO.setmode(GPIO.BCM)
 s = Shifter(data=16, latch=20, clock=21)
@@ -134,9 +117,6 @@ slider_vals = [EL_INITIAL_ANGLE, 0.0]
 status_lock = threading.Lock()
 run_state = {"running": False, "last_error": ""}
 
-# ============================================================
-# Geometry helpers
-# ============================================================
 
 def polar_to_cartesian(r_cm, theta_rad, z_cm=0.0):
     x = r_cm * math.cos(theta_rad)
@@ -164,9 +144,6 @@ def fetch_positions(url, timeout=5.0):
     with urllib.request.urlopen(url, timeout=timeout) as resp:
         return json.load(resp)
 
-# ============================================================
-# Targeting sequence
-# ============================================================
 
 def run_targeting_sequence_thread():
     try:
@@ -234,9 +211,6 @@ def run_targeting_sequence_thread():
         run_state["running"] = False
     print("[TARGETING] Sequence complete.")
 
-# ============================================================
-# HTML UI & Webserver
-# ============================================================
 
 def html_page():
     with status_lock:
